@@ -4,53 +4,63 @@
 using System;
 using System.Net;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Garnet.client;
+using Garnet.cluster.Server.Replication;
+using Garnet.common;
 using Microsoft.Extensions.Logging;
 
 namespace Garnet.cluster
 {
     internal sealed partial class ReplicationManager : IDisposable
     {
+        /// <summary>
+        /// Try to replicate using diskless sync
+        /// </summary>
+        /// <param name="session">ClusterSession for this connection.</param>
+        /// <param name="options">Options for the sync.</param>
+        /// <param name="errorMessage">The ASCII encoded error message if the method returned <see langword="false"/>; otherwise <see langword="default"/></param>
+        /// <returns>A boolean indicating whether replication initiation was successful.</returns>
         public bool TryReplicateDisklessSync(
             ClusterSession session,
-            string nodeId,
-            bool background,
-            bool force,
+            ReplicateSyncOptions options,
             out ReadOnlySpan<byte> errorMessage)
         {
             errorMessage = default;
-            // Ensure two replicate commands do not execute at the same time.
-            if (!replicateLock.TryWriteLock())
-            {
-                errorMessage = CmdStrings.RESP_ERR_GENERIC_CANNOT_ACQUIRE_REPLICATE_LOCK;
-                return false;
-            }
 
             try
             {
-                logger?.LogTrace("CLUSTER REPLICATE {nodeid}", nodeId);
-                if (!clusterProvider.clusterManager.TryAddReplica(nodeId, force: force, out errorMessage, logger: logger))
-                {
-                    replicateLock.WriteUnlock();
+                logger?.LogTrace("CLUSTER REPLICATE {nodeid}", options.NodeId);
+                if (options.TryAddReplica && !clusterProvider.clusterManager.TryAddReplica(options.NodeId, options.Force, options.UpgradeLock, out errorMessage, logger: logger))
                     return false;
-                }
 
                 // Wait for threads to agree configuration change of this node
                 session.UnsafeBumpAndWaitForEpochTransition();
-                _ = Task.Run(() => TryBeginReplicaSync());
+                if (options.Background)
+                    _ = Task.Run(() => TryBeginReplicaSync(options.UpgradeLock));
+                else
+                {
+                    var result = TryBeginReplicaSync(options.UpgradeLock).Result;
+                    if (result != null)
+                    {
+                        errorMessage = Encoding.ASCII.GetBytes(result);
+                        return false;
+                    }
+                }
             }
             catch (Exception ex)
             {
                 logger?.LogError(ex, $"{nameof(TryReplicateDisklessSync)}");
-                replicateLock.WriteUnlock();
             }
+            return true;
 
-            async Task TryBeginReplicaSync()
+            async Task<string> TryBeginReplicaSync(bool downgradeLock)
             {
                 var disklessSync = clusterProvider.serverOptions.ReplicaDisklessSync;
                 var disableObjects = clusterProvider.serverOptions.DisableObjects;
                 GarnetClientSession gcs = null;
+                resetHandler ??= new CancellationTokenSource();
                 try
                 {
                     if (!clusterProvider.serverOptions.EnableFastCommit)
@@ -84,7 +94,7 @@ namespace Garnet.cluster
                     {
                         var errorMsg = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_GENERIC_NOT_ASSIGNED_PRIMARY_ERROR);
                         logger?.LogError("{msg}", errorMsg);
-                        return;
+                        return errorMsg;
                     }
 
                     gcs = new(
@@ -112,29 +122,51 @@ namespace Garnet.cluster
                         currentReplicationOffset: ReplicationOffset,
                         checkpointEntry: checkpointEntry);
 
-                    var resp = await gcs.ExecuteAttachSync(syncMetadata.ToByteArray()).ConfigureAwait(false);
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctsRepManager.Token, resetHandler.Token);
+
+                    // Exception injection point for testing cluster reset during diskless replication
+                    await ExceptionInjectionHelper.WaitOnSet(ExceptionInjectionType.Replication_InProgress_During_Diskless_Replica_Attach_Sync).WaitAsync(storeWrapper.serverOptions.ReplicaAttachTimeout, linkedCts.Token).ConfigureAwait(false);
+
+                    var resp = await gcs.ExecuteAttachSync(syncMetadata.ToByteArray()).WaitAsync(storeWrapper.serverOptions.ReplicaAttachTimeout, linkedCts.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     logger?.LogError(ex, $"{nameof(TryBeginReplicaSync)}");
-                    clusterProvider.clusterManager.TryResetReplica();
-                    SuspendRecovery();
+
+                    if (options.AllowReplicaResetOnFailure)
+                    {
+                        clusterProvider.clusterManager.TryResetReplica();
+                    }
+
+                    return ex.Message;
                 }
                 finally
                 {
-                    replicateLock.WriteUnlock();
+                    if (downgradeLock)
+                    {
+                        EndRecovery(RecoveryStatus.ReadRole, downgradeLock: true);
+                    }
+                    else
+                    {
+                        EndRecovery(RecoveryStatus.NoRecovery, downgradeLock: false);
+                    }
                     gcs?.Dispose();
                     recvCheckpointHandler?.Dispose();
+                    if (!resetHandler.TryReset())
+                    {
+                        resetHandler.Dispose();
+                        resetHandler = new CancellationTokenSource();
+                    }
                 }
+                return null;
             }
-
-            return true;
         }
 
-        public long ReplicaRecoverDiskless(SyncMetadata primarySyncMetadata)
+        public long ReplicaRecoverDiskless(SyncMetadata primarySyncMetadata, out ReadOnlySpan<byte> errorMessage)
         {
             try
             {
+                errorMessage = [];
                 logger?.LogSyncMetadata(LogLevel.Trace, nameof(ReplicaRecoverDiskless), primarySyncMetadata);
 
                 var aofBeginAddress = primarySyncMetadata.currentAofBeginAddress;
@@ -160,12 +192,23 @@ namespace Garnet.cluster
                 TryUpdateMyPrimaryReplId(primarySyncMetadata.currentPrimaryReplId);
 
                 ReplicationOffset = replicationOffset;
+
+                // Mark this txn run as a read-write session if we are replaying as a replica
+                // This is necessary to ensure that the stored procedure can perform write operations if needed
+                clusterProvider.replicationManager.aofProcessor.SetReadWriteSession();
+
                 return ReplicationOffset;
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, $"{nameof(ReplicaRecoverDiskless)}");
+                errorMessage = Encoding.ASCII.GetBytes(ex.Message);
+                return -1;
             }
             finally
             {
                 // Done with recovery at this point
-                SuspendRecovery();
+                EndRecovery(RecoveryStatus.CheckpointRecoveredAtReplica, downgradeLock: false);
             }
         }
     }

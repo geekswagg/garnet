@@ -20,134 +20,23 @@ namespace Garnet.server
         private bool NetworkMGET<TGarnetApi>(ref TGarnetApi storageApi)
             where TGarnetApi : IGarnetApi
         {
+            // Write array header
+            while (!RespWriteUtils.TryWriteArrayLength(parseState.Count, ref dcurr, dend))
+                SendAndReset();
+
             if (storeWrapper.serverOptions.EnableScatterGatherGet)
-                return NetworkMGET_SG(ref storageApi);
-
-            while (!RespWriteUtils.TryWriteArrayLength(parseState.Count, ref dcurr, dend))
-                SendAndReset();
-
-            RawStringInput input = default;
-
-            for (var c = 0; c < parseState.Count; c++)
             {
-                var key = parseState.GetArgSliceByRef(c).SpanByte;
-                var o = new SpanByteAndMemory(dcurr, (int)(dend - dcurr));
-                var status = storageApi.GET(ref key, ref input, ref o);
+                MGetReadArgBatch_SG batch = new(this);
 
-                switch (status)
-                {
-                    case GarnetStatus.OK:
-                        if (!o.IsSpanByte)
-                            SendAndReset(o.Memory, o.Length);
-                        else
-                            dcurr += o.Length;
-                        break;
-                    case GarnetStatus.NOTFOUND:
-                        Debug.Assert(o.IsSpanByte);
-                        while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_ERRNOTFOUND, ref dcurr, dend))
-                            SendAndReset();
-                        break;
-                }
+                storageApi.ReadWithPrefetch(ref batch);
+                batch.CompletePending(ref storageApi);
             }
-            return true;
-        }
-
-        /// <summary>
-        /// MGET - scatter gather version
-        /// </summary>
-        private bool NetworkMGET_SG<TGarnetApi>(ref TGarnetApi storageApi)
-            where TGarnetApi : IGarnetAdvancedApi
-        {
-            var firstPending = -1;
-            (GarnetStatus, SpanByteAndMemory)[] outputArr = null;
-
-            // Write array length header
-            while (!RespWriteUtils.TryWriteArrayLength(parseState.Count, ref dcurr, dend))
-                SendAndReset();
-
-            RawStringInput input = default;
-            SpanByteAndMemory o = new(dcurr, (int)(dend - dcurr));
-
-            for (var c = 0; c < parseState.Count; c++)
+            else
             {
-                var key = parseState.GetArgSliceByRef(c).SpanByte;
-
-                // Store index in context, since completions are not in order
-                long ctx = c;
-
-                var status = storageApi.GET_WithPending(ref key, ref input, ref o, ctx, out var isPending);
-
-                if (isPending)
-                {
-                    if (firstPending == -1)
-                    {
-                        outputArr = new (GarnetStatus, SpanByteAndMemory)[parseState.Count];
-                        firstPending = c;
-                    }
-                    outputArr[c] = (status, default);
-                    o = new SpanByteAndMemory();
-                }
-                else
-                {
-                    if (status == GarnetStatus.OK)
-                    {
-                        if (firstPending == -1)
-                        {
-                            // Found in memory without IO, and no earlier pending, so we can add directly to the output
-                            if (!o.IsSpanByte)
-                                SendAndReset(o.Memory, o.Length);
-                            else
-                                dcurr += o.Length;
-                            o = new SpanByteAndMemory(dcurr, (int)(dend - dcurr));
-                        }
-                        else
-                        {
-                            outputArr[c] = (status, o);
-                            o = new SpanByteAndMemory();
-                        }
-                    }
-                    else
-                    {
-                        if (firstPending == -1)
-                        {
-                            // Realized not-found without IO, and no earlier pending, so we can add directly to the output
-                            while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_ERRNOTFOUND, ref dcurr, dend))
-                                SendAndReset();
-                            o = new SpanByteAndMemory(dcurr, (int)(dend - dcurr));
-                        }
-                        else
-                        {
-                            outputArr[c] = (status, o);
-                            o = new SpanByteAndMemory();
-                        }
-                    }
-                }
+                MGetReadArgBatch<TGarnetApi> batch = new(ref storageApi, this);
+                storageApi.ReadWithPrefetch(ref batch);
             }
 
-            if (firstPending != -1)
-            {
-                // First complete all pending ops
-                storageApi.GET_CompletePending(outputArr, true);
-
-                // Write the outputs to network buffer
-                for (var i = firstPending; i < parseState.Count; i++)
-                {
-                    var status = outputArr[i].Item1;
-                    var output = outputArr[i].Item2;
-                    if (status == GarnetStatus.OK)
-                    {
-                        if (!output.IsSpanByte)
-                            SendAndReset(output.Memory, output.Length);
-                        else
-                            dcurr += output.Length;
-                    }
-                    else
-                    {
-                        while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_ERRNOTFOUND, ref dcurr, dend))
-                            SendAndReset();
-                    }
-                }
-            }
             return true;
         }
 
@@ -164,9 +53,9 @@ namespace Garnet.server
 
             for (int c = 0; c < parseState.Count; c += 2)
             {
-                var key = parseState.GetArgSliceByRef(c).SpanByte;
-                var val = parseState.GetArgSliceByRef(c + 1).SpanByte;
-                _ = storageApi.SET(ref key, ref val);
+                var key = parseState.GetArgSliceByRef(c);
+                var val = parseState.GetArgSliceByRef(c + 1);
+                _ = storageApi.SET(key, val);
             }
             while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
                 SendAndReset();
@@ -226,30 +115,83 @@ namespace Garnet.server
             // Validate index
             if (!parseState.TryGetInt(0, out var index))
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER, ref dcurr, dend))
-                    SendAndReset();
-                return true;
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER);
             }
 
-            if (index < storeWrapper.databaseNum)
+            if (index != 0 && storeWrapper.serverOptions.EnableCluster)
+            {
+                // Cluster mode does not allow non-zero DBID to be selected
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_GENERIC_SELECT_CLUSTER_MODE);
+            }
+
+            if (index < 0 || index >= storeWrapper.serverOptions.MaxDatabases)
+            {
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_DB_INDEX_OUT_OF_RANGE);
+            }
+
+            if (index == this.activeDbId || this.TrySwitchActiveDatabaseSession(index))
             {
                 while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
                     SendAndReset();
             }
             else
             {
-                if (storeWrapper.serverOptions.EnableCluster)
-                {
-                    // Cluster mode does not allow DBID
-                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_SELECT_CLUSTER_MODE, ref dcurr, dend))
-                        SendAndReset();
-                }
-                else
-                {
-                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_SELECT_INVALID_INDEX, ref dcurr, dend))
-                        SendAndReset();
-                }
+                // Should never reach here
+                Debug.Fail("Database SELECT should have succeeded.");
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_SELECT_UNSUCCESSFUL, ref dcurr, dend))
+                    SendAndReset();
             }
+
+            return true;
+        }
+
+        /// <summary>
+        /// SWAPDB index1 index2
+        /// </summary>
+        /// <returns></returns>
+        private bool NetworkSWAPDB()
+        {
+            if (parseState.Count != 2)
+            {
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.SWAPDB));
+            }
+
+            if (storeWrapper.serverOptions.EnableCluster)
+            {
+                // Cluster mode does not allow SWAPDB
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_GENERIC_SWAPDB_CLUSTER_MODE);
+            }
+
+            // Validate index
+            if (!parseState.TryGetInt(0, out var index1))
+            {
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_INVALID_FIRST_DB_INDEX);
+            }
+
+            if (!parseState.TryGetInt(1, out var index2))
+            {
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_INVALID_SECOND_DB_INDEX);
+            }
+
+            if (index1 < 0 ||
+                index2 < 0 ||
+                index1 >= storeWrapper.serverOptions.MaxDatabases ||
+                index2 >= storeWrapper.serverOptions.MaxDatabases)
+            {
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_DB_INDEX_OUT_OF_RANGE);
+            }
+
+            if (storeWrapper.TrySwapDatabases(index1, index2))
+            {
+                while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_SWAPDB_UNSUPPORTED, ref dcurr, dend))
+                    SendAndReset();
+            }
+
             return true;
         }
 
@@ -309,11 +251,9 @@ namespace Garnet.server
                 return AbortWithWrongNumberOfArguments("SCAN");
 
             // Validate scan cursor
-            if (!parseState.TryGetLong(0, out var cursorFromInput))
+            if (!parseState.TryGetLong(0, out var cursorFromInput) || (cursorFromInput < 0))
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_INVALIDCURSOR, ref dcurr, dend))
-                    SendAndReset();
-                return true;
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_GENERIC_INVALIDCURSOR);
             }
 
             var pattern = "*"u8;

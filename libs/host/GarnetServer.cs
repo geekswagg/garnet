@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Garnet.cluster;
@@ -33,7 +34,7 @@ namespace Garnet
         /// <summary>
         /// Resp protocol version
         /// </summary>
-        internal const string RedisProtocolVersion = "7.2.5";
+        internal const string RedisProtocolVersion = "7.4.3";
 
         static readonly string version = GetVersion();
         static string GetVersion()
@@ -45,11 +46,7 @@ namespace Garnet
         internal GarnetProvider Provider;
 
         private readonly GarnetServerOptions opts;
-        private IGarnetServer server;
-        private TsavoriteKV<SpanByte, SpanByte, MainStoreFunctions, MainStoreAllocator> store;
-        private TsavoriteKV<byte[], IGarnetObject, ObjectStoreFunctions, ObjectStoreAllocator> objectStore;
-        private IDevice aofDevice;
-        private TsavoriteLog appendOnlyFile;
+        private IGarnetServer[] servers;
         private SubscribeBroker subscribeBroker;
         private KVSettings<SpanByte, SpanByte> kvSettings;
         private KVSettings<byte[], IGarnetObject> objKvSettings;
@@ -97,7 +94,7 @@ namespace Garnet
                 this.initLogger = (MemoryLogger)memLogProvider.CreateLogger("ArgParser");
             }
 
-            if (!ServerSettingsManager.TryParseCommandLineArguments(commandLineArgs, out var serverSettings, out _, out var exitGracefully, logger: this.initLogger))
+            if (!ServerSettingsManager.TryParseCommandLineArguments(commandLineArgs, out var serverSettings, out _, out _, out var exitGracefully, logger: this.initLogger))
             {
                 if (exitGracefully)
                     Environment.Exit(0);
@@ -150,11 +147,11 @@ namespace Garnet
         /// </summary>
         /// <param name="opts">Server options</param>
         /// <param name="loggerFactory">Logger factory</param>
-        /// <param name="server">The IGarnetServer to use. If none is provided, will use a GarnetServerTcp.</param>
+        /// <param name="servers">The IGarnetServer to use. If none is provided, will use a GarnetServerTcp.</param>
         /// <param name="cleanupDir">Whether to clean up data folders on dispose</param>
-        public GarnetServer(GarnetServerOptions opts, ILoggerFactory loggerFactory = null, IGarnetServer server = null, bool cleanupDir = false)
+        public GarnetServer(GarnetServerOptions opts, ILoggerFactory loggerFactory = null, IGarnetServer[] servers = null, bool cleanupDir = false)
         {
-            this.server = server;
+            this.servers = servers;
             this.opts = opts;
             this.loggerFactory = loggerFactory;
             this.cleanupDir = cleanupDir;
@@ -174,7 +171,7 @@ namespace Garnet
                 Console.WriteLine($"""
                     {red}    _________
                        /_||___||_\      {normal}Garnet {version} {(IntPtr.Size == 8 ? "64" : "32")} bit; {(opts.EnableCluster ? "cluster" : "standalone")} mode{red}
-                       '. \   / .'      {normal}Listening on: {opts.EndPoint}{red}
+                       '. \   / .'      {normal}Listening on: {(opts.EndPoints.Length > 1 ? opts.EndPoints[0] + $" and {opts.EndPoints.Length - 1} more" : opts.EndPoints[0])}{red}
                          '.\ /.'        {magenta}https://aka.ms/GetGarnet{red}
                            '.'
                     {normal}
@@ -184,7 +181,11 @@ namespace Garnet
             var clusterFactory = opts.EnableCluster ? new ClusterFactory() : null;
 
             this.logger = this.loggerFactory?.CreateLogger("GarnetServer");
-            logger?.LogInformation("Garnet {version} {bits} bit; {clusterMode} mode; Endpoint: {endpoint}", version, IntPtr.Size == 8 ? "64" : "32", opts.EnableCluster ? "cluster" : "standalone", opts.EndPoint);
+            logger?.LogInformation("Garnet {version} {bits} bit; {clusterMode} mode; Endpoint: [{endpoint}]",
+                version, IntPtr.Size == 8 ? "64" : "32",
+                opts.EnableCluster ? "cluster" : "standalone",
+                string.Join(',', opts.EndPoints.Select(endpoint => endpoint.ToString())));
+            logger?.LogInformation("Environment .NET {netVersion}; {osPlatform}; {processArch}", Environment.Version, Environment.OSVersion.Platform, RuntimeInformation.ProcessArchitecture);
 
             // Flush initialization logs from memory logger
             FlushMemoryLogger(this.initLogger, "ArgParser", this.loggerFactory);
@@ -227,35 +228,60 @@ namespace Garnet
             if (!setMax && !ThreadPool.SetMaxThreads(maxThreads, maxCPThreads))
                 throw new Exception($"Unable to call ThreadPool.SetMaxThreads with {maxThreads}, {maxCPThreads}");
 
-            CreateMainStore(clusterFactory, out var checkpointDir);
-            CreateObjectStore(clusterFactory, customCommandManager, checkpointDir, out var objectStoreSizeTracker);
+            opts.Initialize(loggerFactory);
+            StoreWrapper.DatabaseCreatorDelegate createDatabaseDelegate = (int dbId) =>
+                CreateDatabase(dbId, opts, clusterFactory, customCommandManager);
 
             if (!opts.DisablePubSub)
                 subscribeBroker = new SubscribeBroker(null, opts.PubSubPageSizeBytes(), opts.SubscriberRefreshFrequencyMs, true, logger);
 
-            CreateAOF();
-
             logger?.LogTrace("TLS is {tlsEnabled}", opts.TlsOptions == null ? "disabled" : "enabled");
+
+            // Create Garnet TCP server if none was provided.
+            if (servers == null)
+            {
+                servers = new IGarnetServer[opts.EndPoints.Length];
+                for (var i = 0; i < servers.Length; i++)
+                {
+                    if (opts.EndPoints[i] is UnixDomainSocketEndPoint)
+                    {
+                        ArgumentException.ThrowIfNullOrWhiteSpace(opts.UnixSocketPath, nameof(opts.UnixSocketPath));
+
+                        // Delete existing unix socket file, if it exists.
+                        File.Delete(opts.UnixSocketPath);
+                    }
+                    servers[i] = new GarnetServerTcp(opts.EndPoints[i], 0, opts.TlsOptions, opts.NetworkSendThrottleMax, opts.NetworkConnectionLimit, opts.UnixSocketPath, opts.UnixSocketPermission, logger);
+                }
+            }
+
+            storeWrapper = new StoreWrapper(version, RedisProtocolVersion, servers, customCommandManager, opts, subscribeBroker,
+                createDatabaseDelegate: createDatabaseDelegate,
+                clusterFactory: clusterFactory,
+                loggerFactory: loggerFactory);
 
             if (logger != null)
             {
-                var configMemoryLimit = (store.IndexSize * 64) + store.Log.MaxMemorySizeBytes + (store.ReadCache?.MaxMemorySizeBytes ?? 0) + (appendOnlyFile?.MaxMemorySizeBytes ?? 0);
-                if (objectStore != null)
-                    configMemoryLimit += objectStore.IndexSize * 64 + objectStore.Log.MaxMemorySizeBytes + (objectStore.ReadCache?.MaxMemorySizeBytes ?? 0) + (objectStoreSizeTracker?.TargetSize ?? 0) + (objectStoreSizeTracker?.ReadCacheTargetSize ?? 0);
+                var configMemoryLimit = (storeWrapper.store.IndexSize * 64) +
+                                        storeWrapper.store.Log.MaxMemorySizeBytes +
+                                        (storeWrapper.store.ReadCache?.MaxMemorySizeBytes ?? 0) +
+                                        (storeWrapper.appendOnlyFile?.MaxMemorySizeBytes ?? 0);
+                if (storeWrapper.objectStore != null)
+                    configMemoryLimit += (storeWrapper.objectStore.IndexSize * 64) +
+                                         storeWrapper.objectStore.Log.MaxMemorySizeBytes +
+                                         (storeWrapper.objectStore.ReadCache?.MaxMemorySizeBytes ?? 0) +
+                                         (storeWrapper.objectStoreSizeTracker?.TargetSize ?? 0) +
+                                         (storeWrapper.objectStoreSizeTracker?.ReadCacheTargetSize ?? 0);
                 logger.LogInformation("Total configured memory limit: {configMemoryLimit}", configMemoryLimit);
             }
 
-            if (opts.EndPoint is UnixDomainSocketEndPoint)
+            var maxDatabases = opts.EnableCluster ? 1 : opts.MaxDatabases;
+            logger?.LogInformation("Max number of logical databases allowed on server: {maxDatabases}", maxDatabases);
+
+            if (opts.ExtensionBinPaths?.Length > 0)
             {
-                // Delete existing unix socket file, if it exists.
-                File.Delete(opts.UnixSocketPath);
+                logger?.LogTrace("Allowed binary paths for extension loading: {binPaths}", string.Join(",", opts.ExtensionBinPaths));
+                logger?.LogTrace("Unsigned extension libraries {unsignedAllowed}allowed.", opts.ExtensionAllowUnsignedAssemblies ? string.Empty : "not ");
             }
-
-            // Create Garnet TCP server if none was provided.
-            this.server ??= new GarnetServerTcp(opts.EndPoint, 0, opts.TlsOptions, opts.NetworkSendThrottleMax, opts.NetworkConnectionLimit, opts.UnixSocketPath, opts.UnixSocketPermission, logger);
-
-            storeWrapper = new StoreWrapper(version, RedisProtocolVersion, server, store, objectStore, objectStoreSizeTracker,
-                    customCommandManager, appendOnlyFile, opts, subscribeBroker, clusterFactory: clusterFactory, loggerFactory: loggerFactory);
 
             // Create session provider for Garnet
             Provider = new GarnetProvider(storeWrapper, subscribeBroker);
@@ -265,9 +291,21 @@ namespace Garnet
             Register = new RegisterApi(Provider);
             Store = new StoreApi(storeWrapper);
 
-            server.Register(WireFormat.ASCII, Provider);
+            for (var i = 0; i < servers.Length; i++)
+                servers[i].Register(WireFormat.ASCII, Provider);
 
             LoadModules(customCommandManager);
+        }
+
+        private GarnetDatabase CreateDatabase(int dbId, GarnetServerOptions serverOptions, ClusterFactory clusterFactory,
+            CustomCommandManager customCommandManager)
+        {
+            var store = CreateMainStore(dbId, clusterFactory, out var epoch, out var stateMachineDriver);
+            var objectStore = CreateObjectStore(dbId, clusterFactory, customCommandManager, epoch, stateMachineDriver, out var objectStoreSizeTracker);
+            var (aofDevice, aof) = CreateAOF(dbId);
+            return new GarnetDatabase(dbId, store, objectStore, epoch, stateMachineDriver, objectStoreSizeTracker,
+                aofDevice, aof, serverOptions.AdjustedIndexMaxCacheLines == 0,
+                serverOptions.AdjustedObjectStoreIndexMaxCacheLines == 0);
         }
 
         private void LoadModules(CustomCommandManager customCommandManager)
@@ -283,93 +321,92 @@ namespace Garnet
 
                 var modulePath = moduleCSData[0];
                 var moduleArgs = moduleCSData.Length > 1 ? moduleCSData.Skip(1).ToArray() : [];
-                if (ModuleUtils.LoadAssemblies([modulePath], null, true, out var loadedAssemblies, out var errorMsg))
-                {
-                    ModuleRegistrar.Instance.LoadModule(customCommandManager, loadedAssemblies.ToList()[0], moduleArgs, logger, out errorMsg);
-                }
-                else
+
+                if (!ModuleUtils.LoadAssemblies([modulePath], null, opts.ExtensionAllowUnsignedAssemblies,
+                        out var loadedAssemblies, out var errorMsg, ignorePathCheckWhenUndefined: true)
+                    || !ModuleRegistrar.Instance.LoadModule(customCommandManager, loadedAssemblies.ToList()[0], moduleArgs, logger, out errorMsg))
                 {
                     logger?.LogError("Module {0} failed to load with error {1}", modulePath, Encoding.UTF8.GetString(errorMsg));
                 }
             }
         }
 
-        private void CreateMainStore(IClusterFactory clusterFactory, out string checkpointDir)
+        private TsavoriteKV<SpanByte, SpanByte, MainStoreFunctions, MainStoreAllocator> CreateMainStore(int dbId, IClusterFactory clusterFactory,
+            out LightEpoch epoch, out StateMachineDriver stateMachineDriver)
         {
-            kvSettings = opts.GetSettings(loggerFactory, out logFactory);
+            epoch = new LightEpoch();
+            stateMachineDriver = new StateMachineDriver(epoch, loggerFactory?.CreateLogger($"StateMachineDriver"));
 
-            checkpointDir = opts.CheckpointDir ?? opts.LogDir;
+            kvSettings = opts.GetSettings(loggerFactory, epoch, stateMachineDriver, out logFactory);
 
             // Run checkpoint on its own thread to control p99
             kvSettings.ThrottleCheckpointFlushDelayMs = opts.CheckpointThrottleFlushDelayMs;
 
-            if (opts.EnableCluster)
-            {
-                kvSettings.CheckpointManager = clusterFactory.CreateCheckpointManager(opts.DeviceFactoryCreator,
-                    new DefaultCheckpointNamingScheme(checkpointDir + "/Store/checkpoints"), isMainStore: true, logger);
-            }
-            else
-            {
-                kvSettings.CheckpointManager = new DeviceLogCommitCheckpointManager(opts.DeviceFactoryCreator,
-                    new DefaultCheckpointNamingScheme(checkpointDir + "/Store/checkpoints"), removeOutdated: true);
-            }
+            var baseName = opts.GetMainStoreCheckpointDirectory(dbId);
+            var defaultNamingScheme = new DefaultCheckpointNamingScheme(baseName);
 
-            store = new(kvSettings
+            kvSettings.CheckpointManager = opts.EnableCluster ?
+                clusterFactory.CreateCheckpointManager(opts.DeviceFactoryCreator, defaultNamingScheme, isMainStore: true, logger) :
+                new GarnetCheckpointManager(opts.DeviceFactoryCreator, defaultNamingScheme, removeOutdated: true);
+
+            return new TsavoriteKV<SpanByte, SpanByte, MainStoreFunctions, MainStoreAllocator>(kvSettings
                 , StoreFunctions<SpanByte, SpanByte>.Create()
                 , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions));
         }
 
-        private void CreateObjectStore(IClusterFactory clusterFactory, CustomCommandManager customCommandManager, string CheckpointDir, out CacheSizeTracker objectStoreSizeTracker)
+        private TsavoriteKV<byte[], IGarnetObject, ObjectStoreFunctions, ObjectStoreAllocator> CreateObjectStore(int dbId, IClusterFactory clusterFactory, CustomCommandManager customCommandManager,
+            LightEpoch epoch, StateMachineDriver stateMachineDriver, out CacheSizeTracker objectStoreSizeTracker)
         {
             objectStoreSizeTracker = null;
-            if (!opts.DisableObjects)
-            {
-                objKvSettings = opts.GetObjectStoreSettings(this.loggerFactory?.CreateLogger("TsavoriteKV  [obj]"),
-                    out var objHeapMemorySize, out var objReadCacheHeapMemorySize);
+            if (opts.DisableObjects)
+                return null;
 
-                // Run checkpoint on its own thread to control p99
-                objKvSettings.ThrottleCheckpointFlushDelayMs = opts.CheckpointThrottleFlushDelayMs;
+            objKvSettings = opts.GetObjectStoreSettings(loggerFactory, epoch, stateMachineDriver,
+                out var objHeapMemorySize, out var objReadCacheHeapMemorySize);
 
-                if (opts.EnableCluster)
-                    objKvSettings.CheckpointManager = clusterFactory.CreateCheckpointManager(
-                        opts.DeviceFactoryCreator,
-                        new DefaultCheckpointNamingScheme(CheckpointDir + "/ObjectStore/checkpoints"),
-                        isMainStore: false, logger);
-                else
-                    objKvSettings.CheckpointManager = new DeviceLogCommitCheckpointManager(opts.DeviceFactoryCreator,
-                        new DefaultCheckpointNamingScheme(CheckpointDir + "/ObjectStore/checkpoints"),
-                        removeOutdated: true);
+            // Run checkpoint on its own thread to control p99
+            objKvSettings.ThrottleCheckpointFlushDelayMs = opts.CheckpointThrottleFlushDelayMs;
 
-                objectStore = new(objKvSettings
-                    , StoreFunctions<byte[], IGarnetObject>.Create(new ByteArrayKeyComparer(),
-                        () => new ByteArrayBinaryObjectSerializer(),
-                        () => new GarnetObjectSerializer(customCommandManager))
-                    , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions));
+            var baseName = opts.GetObjectStoreCheckpointDirectory(dbId);
+            var defaultNamingScheme = new DefaultCheckpointNamingScheme(baseName);
 
-                if (objHeapMemorySize > 0 || objReadCacheHeapMemorySize > 0)
-                    objectStoreSizeTracker = new CacheSizeTracker(objectStore, objKvSettings, objHeapMemorySize, objReadCacheHeapMemorySize,
-                        this.loggerFactory);
-            }
+            objKvSettings.CheckpointManager = opts.EnableCluster ?
+                clusterFactory.CreateCheckpointManager(opts.DeviceFactoryCreator, defaultNamingScheme, isMainStore: false, logger) :
+                new GarnetCheckpointManager(opts.DeviceFactoryCreator, defaultNamingScheme, removeOutdated: true);
+
+            var objStore = new TsavoriteKV<byte[], IGarnetObject, ObjectStoreFunctions, ObjectStoreAllocator>(
+                objKvSettings,
+                StoreFunctions<byte[], IGarnetObject>.Create(new ByteArrayKeyComparer(),
+                    () => new ByteArrayBinaryObjectSerializer(),
+                    () => new GarnetObjectSerializer(customCommandManager)),
+                (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions));
+
+            if (objHeapMemorySize > 0 || objReadCacheHeapMemorySize > 0)
+                objectStoreSizeTracker = new CacheSizeTracker(objStore, objKvSettings, objHeapMemorySize, objReadCacheHeapMemorySize,
+                    this.loggerFactory);
+
+            return objStore;
+
         }
 
-        private void CreateAOF()
+        private (IDevice, TsavoriteLog) CreateAOF(int dbId)
         {
-            if (opts.EnableAOF)
+            if (!opts.EnableAOF)
             {
-                if (opts.FastAofTruncate && opts.CommitFrequencyMs != -1)
-                    throw new Exception("Need to set CommitFrequencyMs to -1 (manual commits) with MainMemoryReplication");
-
-                opts.GetAofSettings(out var aofSettings);
-                aofDevice = aofSettings.LogDevice;
-                appendOnlyFile = new TsavoriteLog(aofSettings, logger: this.loggerFactory?.CreateLogger("TsavoriteLog [aof]"));
-
-                if (opts.CommitFrequencyMs < 0 && opts.WaitForCommit)
-                    throw new Exception("Cannot use CommitWait with manual commits");
-                return;
+                if (opts.CommitFrequencyMs != 0 || opts.WaitForCommit)
+                    throw new Exception("Cannot use CommitFrequencyMs or CommitWait without EnableAOF");
+                return (null, null);
             }
 
-            if (opts.CommitFrequencyMs != 0 || opts.WaitForCommit)
-                throw new Exception("Cannot use CommitFrequencyMs or CommitWait without EnableAOF");
+            if (opts.FastAofTruncate && opts.CommitFrequencyMs != -1)
+                throw new Exception("Need to set CommitFrequencyMs to -1 (manual commits) with FastAofTruncate");
+
+            opts.GetAofSettings(dbId, out var aofSettings);
+            var aofDevice = aofSettings.LogDevice;
+            var appendOnlyFile = new TsavoriteLog(aofSettings, logger: this.loggerFactory?.CreateLogger("TsavoriteLog [aof]"));
+            if (opts.CommitFrequencyMs < 0 && opts.WaitForCommit)
+                throw new Exception("Cannot use CommitWait with manual commits");
+            return (aofDevice, appendOnlyFile);
         }
 
         /// <summary>
@@ -378,7 +415,8 @@ namespace Garnet
         public void Start()
         {
             Provider.Recover();
-            server.Start();
+            for (var i = 0; i < servers.Length; i++)
+                servers[i].Start();
             Provider.Start();
             if (!opts.QuietMode)
                 Console.WriteLine("* Ready to accept connections");
@@ -413,15 +451,12 @@ namespace Garnet
         private void InternalDispose()
         {
             Provider?.Dispose();
-            server.Dispose();
+            for (var i = 0; i < servers.Length; i++)
+                servers[i]?.Dispose();
             subscribeBroker?.Dispose();
-            store.Dispose();
-            appendOnlyFile?.Dispose();
-            aofDevice?.Dispose();
             kvSettings.LogDevice?.Dispose();
             if (!opts.DisableObjects)
             {
-                objectStore.Dispose();
                 objKvSettings.LogDevice?.Dispose();
                 objKvSettings.ObjectLogDevice?.Dispose();
             }

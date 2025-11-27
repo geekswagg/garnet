@@ -3,9 +3,9 @@
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 
@@ -92,19 +92,6 @@ namespace Tsavorite.core
             deviceFactory.Delete(checkpointNamingScheme.IndexCheckpointBase(token));
         }
 
-        /// <summary>
-        /// Create new instance of log commit manager
-        /// </summary>
-        /// <param name="deviceFactoryCreator">Creator of factory for getting devices</param>
-        /// <param name="baseName">Overall location specifier (e.g., local path or cloud container name)</param>
-        /// <param name="removeOutdated">Remote older Tsavorite log commits</param>
-        /// <param name="logger">Remote older Tsavorite log commits</param>
-        public DeviceLogCommitCheckpointManager(INamedDeviceFactoryCreator deviceFactoryCreator, string baseName, bool removeOutdated = false, ILogger logger = null)
-            : this(deviceFactoryCreator, new DefaultCheckpointNamingScheme(baseName), removeOutdated)
-        {
-            this.logger = logger;
-        }
-
         #region ILogCommitManager
 
         /// <inheritdoc />
@@ -181,6 +168,9 @@ namespace Tsavorite.core
         #region ICheckpointManager
 
         /// <inheritdoc />
+        public virtual byte[] GetCookie() => null;
+
+        /// <inheritdoc />
         public unsafe void CommitIndexCheckpoint(Guid indexToken, byte[] commitMetadata)
         {
             var device = NextIndexCheckpointDevice(indexToken);
@@ -193,7 +183,11 @@ namespace Tsavorite.core
 
             WriteInto(device, 0, ms.ToArray(), (int)ms.Position);
             device.Dispose();
+        }
 
+        /// <inheritdoc />
+        public unsafe void CleanupIndexCheckpoint(Guid indexToken)
+        {
             if (removeOutdated)
             {
                 var prior = indexTokenHistory[indexTokenHistoryOffset];
@@ -228,7 +222,7 @@ namespace Tsavorite.core
         }
 
         /// <inheritdoc />
-        public virtual unsafe void CommitLogCheckpoint(Guid logToken, byte[] commitMetadata)
+        public unsafe void CommitLogCheckpointMetadata(Guid logToken, byte[] commitMetadata)
         {
             var device = NextLogCheckpointDevice(logToken);
 
@@ -240,7 +234,11 @@ namespace Tsavorite.core
 
             WriteInto(device, 0, ms.ToArray(), (int)ms.Position);
             device.Dispose();
+        }
 
+        /// <inheritdoc />
+        public unsafe void CleanupLogCheckpoint(Guid logToken)
+        {
             if (removeOutdated)
             {
                 var prior = logTokenHistory[logTokenHistoryOffset];
@@ -252,9 +250,9 @@ namespace Tsavorite.core
         }
 
         /// <inheritdoc />
-        public virtual unsafe void CommitLogIncrementalCheckpoint(Guid logToken, long version, byte[] commitMetadata, DeltaLog deltaLog)
+        public virtual unsafe void CommitLogIncrementalCheckpoint(Guid logToken, byte[] commitMetadata, DeltaLog deltaLog)
         {
-            deltaLog.Allocate(out int length, out long physicalAddress);
+            deltaLog.Allocate(out var length, out var physicalAddress);
             if (length < commitMetadata.Length)
             {
                 deltaLog.Seal(0, DeltaLogEntryType.CHECKPOINT_METADATA);
@@ -274,13 +272,18 @@ namespace Tsavorite.core
         }
 
         /// <inheritdoc />
+        public virtual unsafe void CleanupLogIncrementalCheckpoint(Guid logToken)
+        {
+        }
+
+        /// <inheritdoc />
         public IEnumerable<Guid> GetLogCheckpointTokens()
         {
             return deviceFactory.ListContents(checkpointNamingScheme.LogCheckpointBasePath).Select(checkpointNamingScheme.Token);
         }
 
         /// <inheritdoc />
-        public virtual byte[] GetLogCheckpointMetadata(Guid logToken, DeltaLog deltaLog, bool scanDelta, long recoverTo)
+        public virtual byte[] GetLogCheckpointMetadata(Guid logToken, DeltaLog deltaLog, bool scanDelta = false, long recoverTo = -1)
         {
             byte[] metadata = null;
             if (deltaLog != null && scanDelta)
@@ -301,12 +304,13 @@ namespace Tsavorite.core
                                 fixed (byte* m = metadata)
                                     Buffer.MemoryCopy((void*)physicalAddress, m, entryLength, entryLength);
                             }
-                            HybridLogRecoveryInfo recoveryInfo = new();
+
+                            var hlri = new HybridLogRecoveryInfo();
                             using (StreamReader s = new(new MemoryStream(metadata)))
                             {
-                                recoveryInfo.Initialize(s);
+                                hlri.Initialize(s);
                                 // Finish recovery if only specific versions are requested
-                                if (recoveryInfo.version == recoverTo || recoveryInfo.version < recoverTo && recoveryInfo.nextVersion > recoverTo) goto LoopEnd;
+                                if (hlri.version == recoverTo || hlri.version < recoverTo && hlri.nextVersion > recoverTo) goto LoopEnd;
                             }
                             continue;
                         default:
@@ -316,13 +320,12 @@ namespace Tsavorite.core
                     break;
                 }
                 if (metadata != null) return metadata;
-
             }
 
             var device = deviceFactory.Get(checkpointNamingScheme.LogCheckpointMetadata(logToken));
 
             ReadInto(device, 0, out byte[] writePad, sizeof(int));
-            int size = BitConverter.ToInt32(writePad, 0);
+            var size = BitConverter.ToInt32(writePad, 0);
 
             byte[] body;
             if (writePad.Length >= size + sizeof(int))
@@ -330,6 +333,7 @@ namespace Tsavorite.core
             else
                 ReadInto(device, 0, out body, size + sizeof(int));
             device.Dispose();
+
             return body.AsSpan().Slice(sizeof(int), size).ToArray();
         }
 
@@ -426,11 +430,14 @@ namespace Tsavorite.core
         {
             if (errorCode != 0)
             {
-                var errorMessage = new Win32Exception((int)errorCode).Message;
+                var errorMessage = Utility.GetCallbackErrorMessage(errorCode, numBytes, context);
                 logger?.LogError("[DeviceLogManager] OverlappedStream GetQueuedCompletionStatus error: {errorCode} msg: {errorMessage}", errorCode, errorMessage);
             }
             semaphore.Release();
         }
+
+        [DllImport("libc")]
+        private static extern IntPtr strerror(int errnum);
 
         /// <summary>
         /// Note: will read potentially more data (based on sector alignment)
@@ -448,14 +455,21 @@ namespace Tsavorite.core
             numBytesToRead = ((numBytesToRead + (device.SectorSize - 1)) & ~(device.SectorSize - 1));
 
             var pbuffer = bufferPool.Get((int)numBytesToRead);
-            device.ReadAsync(address, (IntPtr)pbuffer.aligned_pointer,
-                (uint)numBytesToRead, IOCallback, null);
-            semaphore.Wait();
 
-            buffer = new byte[numBytesToRead];
-            fixed (byte* bufferRaw = buffer)
-                Buffer.MemoryCopy(pbuffer.aligned_pointer, bufferRaw, numBytesToRead, numBytesToRead);
-            pbuffer.Return();
+            try
+            {
+                device.ReadAsync(address, (IntPtr)pbuffer.aligned_pointer,
+                    (uint)numBytesToRead, IOCallback, null);
+                semaphore.Wait();
+
+                buffer = new byte[numBytesToRead];
+                fixed (byte* bufferRaw = buffer)
+                    Buffer.MemoryCopy(pbuffer.aligned_pointer, bufferRaw, numBytesToRead, numBytesToRead);
+            }
+            finally
+            {
+                pbuffer.Return();
+            }
         }
 
         /// <summary>
@@ -479,14 +493,24 @@ namespace Tsavorite.core
                 Buffer.MemoryCopy(bufferRaw, pbuffer.aligned_pointer, size, size);
             }
 
-            device.WriteAsync((IntPtr)pbuffer.aligned_pointer, address, (uint)numBytesToWrite, IOCallback, null);
-            semaphore.Wait();
-
-            pbuffer.Return();
+            try
+            {
+                device.WriteAsync((IntPtr)pbuffer.aligned_pointer, address, (uint)numBytesToWrite, IOCallback, null);
+                semaphore.Wait();
+            }
+            finally
+            {
+                pbuffer.Return();
+            }
         }
 
         /// <inheritdoc />
-        public virtual void CheckpointVersionShift(long oldVersion, long newVersion)
+        public virtual void CheckpointVersionShiftStart(long oldVersion, long newVersion, bool isStreaming)
+        {
+        }
+
+        /// <inheritdoc />
+        public virtual void CheckpointVersionShiftEnd(long oldVersion, long newVersion, bool isStreaming)
         {
         }
     }

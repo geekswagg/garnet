@@ -1,6 +1,8 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#nullable disable
+
 using System.Net;
 using System.Net.Security;
 using Garnet.common;
@@ -14,6 +16,28 @@ namespace Embedded.server
     {
         public GarnetServerEmbedded() : base(new IPEndPoint(IPAddress.Loopback, 0), 1 << 10)
         {
+        }
+
+        /// <inheritdoc/>
+        public override IEnumerable<IMessageConsumer> ActiveConsumers()
+        {
+            foreach (var kvp in activeHandlers)
+            {
+                var consumer = kvp.Key.Session;
+                if (consumer != null)
+                    yield return consumer;
+            }
+        }
+
+        /// <inheritdoc/>
+        public override IEnumerable<IClusterSession> ActiveClusterSessions()
+        {
+            foreach (var kvp in activeHandlers)
+            {
+                var consumer = kvp.Key.Session;
+                if (consumer != null)
+                    yield return ((RespServerSession)consumer).clusterSession;
+            }
         }
 
         public EmbeddedNetworkHandler CreateNetworkHandler(SslClientAuthenticationOptions tlsOptions = null, string remoteEndpointName = null)
@@ -33,21 +57,33 @@ namespace Embedded.server
                         handler = new EmbeddedNetworkHandler(this, networkSender, networkSettings, networkPool, tlsOptions != null);
                         if (!activeHandlers.TryAdd(handler, default))
                             throw new Exception("Unable to add handler to dictionary");
-
-                        handler.Start(tlsOptions, remoteEndpointName);
-                        IncrementConnectionsReceived();
-                        return handler;
                     }
                     catch (Exception ex)
                     {
-                        logger?.LogError(ex, "Error starting network handler");
-                        Interlocked.Decrement(ref activeHandlerCount);
+                        logger?.LogError(ex, "Error creating and registering network handler");
+
+                        // We need to decrement the active handler count and dispose because the handler was not added to the activeHandlers dictionary.
+                        _ = Interlocked.Decrement(ref activeHandlerCount);
+                        // Dispose the embedded handler (also disposes resources)
                         handler?.Dispose();
+                    }
+
+                    try
+                    {
+                        IncrementConnectionsReceived();
+                        handler.Start(tlsOptions, remoteEndpointName);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogError(ex, "Error calling Start on network handler");
+
+                        // Dispose the embedded handler (also disposes resources)
+                        handler.Dispose();
                     }
                 }
                 else
                 {
-                    Interlocked.Decrement(ref activeHandlerCount);
+                    _ = Interlocked.Decrement(ref activeHandlerCount);
                 }
             }
             return handler;

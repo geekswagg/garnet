@@ -3,6 +3,9 @@
 
 using System;
 using System.Collections.Generic;
+#if DEBUG
+using Garnet.common;
+#endif
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
@@ -139,18 +142,19 @@ namespace Garnet.test.cluster
 
         /// <summary>
         /// Re-attach replica on disconnect after it has received some amount of data.
-        /// The replica should replay only the portion it missed without doing a full sync
+        /// The replica should replay only the portion it missed without doing a full sync,
+        /// unless force full sync by setting the full sync AOF threshold to a very low value (1k).
         /// </summary>
         /// <param name="disableObjects"></param>
         /// <param name="performRMW"></param>
         [Test, Order(2)]
         [Category("REPLICATION")]
-        public void ClusterAofReplayDisklessSync([Values] bool disableObjects, [Values] bool performRMW)
+        public void ClusterAofReplayDisklessSync([Values] bool disableObjects, [Values] bool performRMW, [Values] bool forceFullSync)
         {
             var nodes_count = 2;
             var primaryIndex = 0;
             var replicaIndex = 1;
-            context.CreateInstances(nodes_count, disableObjects: disableObjects, enableAOF: true, useTLS: useTLS, enableDisklessSync: true, timeout: timeout);
+            context.CreateInstances(nodes_count, disableObjects: disableObjects, enableAOF: true, useTLS: useTLS, enableDisklessSync: true, timeout: timeout, replicaDisklessSyncFullSyncAofThreshold: forceFullSync ? "1k" : string.Empty);
             context.CreateConnection(useTLS: useTLS);
 
             // Setup primary and introduce it to future replica
@@ -185,6 +189,9 @@ namespace Garnet.test.cluster
 
             // Validate replica data
             Validate(primaryIndex, replicaIndex, disableObjects);
+
+            // Wait for replica to catch up
+            context.clusterTestUtils.WaitForReplicaAofSync(primaryIndex, replicaIndex, logger: context.logger);
         }
 
         /// <summary>
@@ -236,7 +243,11 @@ namespace Garnet.test.cluster
             // Validate db version
             var primaryVersion = context.clusterTestUtils.GetStoreCurrentVersion(primaryIndex, isMainStore: true, logger: context.logger);
             var replicaOneVersion = context.clusterTestUtils.GetStoreCurrentVersion(replicaOneIndex, isMainStore: true, logger: context.logger);
-            ClassicAssert.AreEqual(2, primaryVersion);
+
+            // With unified store, versions increase per scan (main and object)
+            // so expected versions depend on whether objects are disabled or not
+            var expectedVersion1 = disableObjects ? 2 : 3;
+            ClassicAssert.AreEqual(expectedVersion1, primaryVersion);
             ClassicAssert.AreEqual(primaryVersion, replicaOneVersion);
 
             // Reset and re-attach replica as primary
@@ -258,9 +269,13 @@ namespace Garnet.test.cluster
             primaryVersion = context.clusterTestUtils.GetStoreCurrentVersion(primaryIndex, isMainStore: true, logger: context.logger);
             replicaOneVersion = context.clusterTestUtils.GetStoreCurrentVersion(replicaOneIndex, isMainStore: true, logger: context.logger);
             var replicaTwoVersion = context.clusterTestUtils.GetStoreCurrentVersion(replicaTwoIndex, isMainStore: true, logger: context.logger);
-            ClassicAssert.AreEqual(3, primaryVersion);
+
+            // With unified store, versions increase per scan (main and object)
+            // so expected versions depend on whether objects are disabled or not
+            var expectedVersion2 = disableObjects ? 3 : 5;
+            ClassicAssert.AreEqual(expectedVersion2, primaryVersion);
             ClassicAssert.AreEqual(primaryVersion, replicaTwoVersion);
-            ClassicAssert.AreEqual(2, replicaOneVersion);
+            ClassicAssert.AreEqual(expectedVersion1, replicaOneVersion);
 
             // Re-attach first replica
             _ = context.clusterTestUtils.ClusterReplicate(replicaNodeIndex: replicaOneIndex, primaryNodeIndex: primaryIndex, logger: context.logger);
@@ -271,7 +286,11 @@ namespace Garnet.test.cluster
             primaryVersion = context.clusterTestUtils.GetStoreCurrentVersion(primaryIndex, isMainStore: true, logger: context.logger);
             replicaOneVersion = context.clusterTestUtils.GetStoreCurrentVersion(replicaOneIndex, isMainStore: true, logger: context.logger);
             replicaTwoVersion = context.clusterTestUtils.GetStoreCurrentVersion(replicaTwoIndex, isMainStore: true, logger: context.logger);
-            ClassicAssert.AreEqual(4, primaryVersion);
+
+            // With unified store, versions increase per scan (main and object)
+            // so expected versions depend on whether objects are disabled or not
+            var expectedVersion3 = disableObjects ? 4 : 7;
+            ClassicAssert.AreEqual(expectedVersion3, primaryVersion);
             ClassicAssert.AreEqual(primaryVersion, replicaOneVersion);
             ClassicAssert.AreEqual(primaryVersion, replicaTwoVersion);
         }
@@ -379,5 +398,39 @@ namespace Garnet.test.cluster
             for (var replica = 1; replica < nodes_count; replica++)
                 Validate(nOffsets[primary], nOffsets[replica], disableObjects);
         }
+
+#if DEBUG
+        [Test, Order(6)]
+        [Category("REPLICATION")]
+        public void ClusterDisklessSyncResetSyncManagerCts()
+        {
+            var nodes_count = 2;
+            var primaryIndex = 0;
+            var replicaOneIndex = 1;
+            context.CreateInstances(nodes_count, enableAOF: true, useTLS: useTLS, enableDisklessSync: true, timeout: timeout);
+            context.CreateConnection(useTLS: useTLS);
+
+            _ = context.clusterTestUtils.AddDelSlotsRange(primaryIndex, [(0, 16383)], addslot: true, logger: context.logger);
+            context.clusterTestUtils.SetConfigEpoch(primaryIndex, primaryIndex + 1, logger: context.logger);
+            context.clusterTestUtils.SetConfigEpoch(replicaOneIndex, replicaOneIndex + 1, logger: context.logger);
+
+            context.clusterTestUtils.Meet(primaryIndex, replicaOneIndex, logger: context.logger);
+            context.clusterTestUtils.WaitUntilNodeIsKnown(replicaOneIndex, primaryIndex, logger: context.logger);
+
+            try
+            {
+                ExceptionInjectionHelper.EnableException(ExceptionInjectionType.Replication_Diskless_Sync_Reset_Cts);
+                var _resp = context.clusterTestUtils.ClusterReplicate(replicaNodeIndex: replicaOneIndex, primaryNodeIndex: primaryIndex, failEx: false, logger: context.logger);
+                ClassicAssert.AreEqual("Wait for sync task faulted", _resp);
+            }
+            finally
+            {
+                ExceptionInjectionHelper.DisableException(ExceptionInjectionType.Replication_Diskless_Sync_Reset_Cts);
+            }
+
+            var resp = context.clusterTestUtils.ClusterReplicate(replicaNodeIndex: replicaOneIndex, primaryNodeIndex: primaryIndex, logger: context.logger);
+            ClassicAssert.AreEqual("OK", resp);
+        }
+#endif
     }
 }

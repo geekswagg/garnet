@@ -3,6 +3,7 @@
 
 using System;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -518,7 +519,7 @@ namespace Garnet.test
                 var sc = new CancellationTokenSource();
                 var t = sc.Token;
                 ManualResetEventSlim mrObj = new(false);
-                var tDeletingK = Task.Run(async () => { await DeleteKeysWithCT(keys.Skip(iterationSize).Take(iterationSize).ToArray(), null, mrObj, t); });
+                var tDeletingK = Task.Run(async () => { await DeleteKeysWithCT([.. keys.Skip(iterationSize).Take(iterationSize)], null, mrObj, t); });
 
                 // send the cancellation so the task throws an exception
                 sc.Cancel();
@@ -547,7 +548,7 @@ namespace Garnet.test
                 ManualResetEventSlim mrObj = new(false);
 
                 // try delete using Memory<byte> type
-                var tDeletingKeysMB = Task.Run(async () => { await DeleteKeysWithCT(null, keysMemoryByte.Skip(iterationSize).Take(iterationSize).ToArray(), mrObj, t, true); });
+                var tDeletingKeysMB = Task.Run(async () => { _ = await DeleteKeysWithCT(null, [.. keysMemoryByte.Skip(iterationSize).Take(iterationSize)], mrObj, t, true); });
                 sc.Cancel();
                 mrObj.Set();
                 Assert.Throws<OperationCanceledException>(() => tDeletingKeysMB.Wait(sc.Token));
@@ -594,18 +595,25 @@ namespace Garnet.test
         }
 
         [Test]
-        public async Task UnixSocket_Ping([Values] bool useTls)
+        public async Task MultipleSocketPing([Values] bool useTls)
         {
             var unixSocketPath = "./unix-socket-ping-test.sock";
             var unixSocketEndpoint = new UnixDomainSocketEndPoint(unixSocketPath);
+            var tcpEndpoint = new IPEndPoint(IPAddress.Loopback, TestUtils.TestPort);
 
-            using var server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, unixSocketEndpoint, enableTLS: useTls, unixSocketPath: unixSocketPath);
+            using var server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, [unixSocketEndpoint, tcpEndpoint], enableTLS: useTls, unixSocketPath: unixSocketPath);
             server.Start();
 
             using var db = TestUtils.GetGarnetClient(unixSocketEndpoint, useTLS: useTls);
             await db.ConnectAsync();
 
             var result = await db.ExecuteForStringResultAsync("PING");
+            ClassicAssert.AreEqual("PONG", result);
+
+            using var tcpClient = TestUtils.GetGarnetClient(tcpEndpoint, useTLS: useTls);
+            await tcpClient.ConnectAsync();
+
+            result = await db.ExecuteForStringResultAsync("PING");
             ClassicAssert.AreEqual("PONG", result);
         }
     }

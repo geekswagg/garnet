@@ -69,16 +69,9 @@ namespace Garnet.test
             var db = redis.GetDatabase(0);
 
             // Check RUNTXP without id
-            try
-            {
-                db.Execute("RUNTXP");
-                Assert.Fail();
-            }
-            catch (RedisServerException e)
-            {
-                var expectedErrorMessage = string.Format(CmdStrings.GenericErrWrongNumArgs, nameof(RespCommand.RUNTXP));
-                ClassicAssert.AreEqual(expectedErrorMessage, e.Message);
-            }
+            var e = Assert.Throws<RedisServerException>(() => db.Execute("RUNTXP"));
+            var expectedErrorMessage = string.Format(CmdStrings.GenericErrWrongNumArgs, nameof(RespCommand.RUNTXP));
+            ClassicAssert.AreEqual(expectedErrorMessage, e.Message);
 
             string readkey = "readkey";
             string value = "foovalue0";
@@ -88,16 +81,9 @@ namespace Garnet.test
             string writekey2 = "writekey2";
 
             // Check RUNTXP with insufficient parameters
-            try
-            {
-                db.Execute("RUNTXP", id, readkey);
-                Assert.Fail();
-            }
-            catch (RedisServerException e)
-            {
-                var expectedErrorMessage = string.Format(CmdStrings.GenericErrWrongNumArgsTxn, id, numParams, 1);
-                ClassicAssert.AreEqual(expectedErrorMessage, e.Message);
-            }
+            e = Assert.Throws<RedisServerException>(() => db.Execute("RUNTXP", id, readkey));
+            expectedErrorMessage = string.Format(CmdStrings.GenericErrWrongNumArgsTxn, id, numParams, 1);
+            ClassicAssert.AreEqual(expectedErrorMessage, e.Message);
 
             var result = db.Execute("RUNTXP", id, readkey, writekey1, writekey2);
             ClassicAssert.AreEqual("SUCCESS", (string)result);
@@ -289,10 +275,12 @@ namespace Garnet.test
         }
 
         [Test]
-        public void TransactionObjectsOperTest()
+        [TestCase(RedisProtocol.Resp2)]
+        [TestCase(RedisProtocol.Resp3)]
+        public void TransactionObjectsOperTest(RedisProtocol protocol)
         {
             server.Register.NewTransactionProc("SORTEDSETPROC", () => new TestProcedureSortedSets(), new RespCommandsInfo { Arity = 25 });
-            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(protocol: protocol));
             var db = redis.GetDatabase(0);
 
             string ssA = "ssA";
@@ -310,15 +298,16 @@ namespace Garnet.test
         [Test]
         public void TransactionListsOperTest()
         {
-            server.Register.NewTransactionProc("LISTPROC", () => new TestProcedureLists(), new RespCommandsInfo { Arity = 13 });
+            server.Register.NewTransactionProc("LISTPROC", () => new TestProcedureLists(), new RespCommandsInfo { Arity = 14 });
 
             using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
             var db = redis.GetDatabase(0);
 
             string lstA = "listA";
             string lstB = "listB";
+            string lstC = "listC";
 
-            var result = db.Execute("LISTPROC", lstA, lstB, "item1", "item2", "item3", "item4", "item5", "item6", "item7", "item8", "item9", "item10");
+            var result = db.Execute("LISTPROC", lstA, lstB, lstC, "item1", "item2", "item3", "item4", "item5", "item6", "item7", "item8", "item9", "item10");
 
             ClassicAssert.AreEqual("SUCCESS", (string)result);
 
@@ -331,11 +320,13 @@ namespace Garnet.test
         }
 
         [Test]
-        public void TransactionSetProcTest()
+        [TestCase(RedisProtocol.Resp2)]
+        [TestCase(RedisProtocol.Resp3)]
+        public void TransactionSetProcTest(RedisProtocol protocol)
         {
             server.Register.NewTransactionProc("SETPROC", () => new TestProcedureSet(), new RespCommandsInfo { Arity = 13 });
 
-            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(protocol: protocol));
             var db = redis.GetDatabase(0);
 
             string setA = "setA";
@@ -351,11 +342,13 @@ namespace Garnet.test
 
 
         [Test]
-        public void TransactionHashProcTest()
+        [TestCase(RedisProtocol.Resp2)]
+        [TestCase(RedisProtocol.Resp3)]
+        public void TransactionHashProcTest(RedisProtocol protocol)
         {
             server.Register.NewTransactionProc("HASHPROC", () => new TestProcedureHash(), new RespCommandsInfo { Arity = 15 });
 
-            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(protocol: protocol));
             var db = redis.GetDatabase(0);
 
             string mh = "myHash";

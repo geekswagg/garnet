@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace Tsavorite.core
@@ -41,36 +40,43 @@ namespace Tsavorite.core
 
         internal Task<LinkedCheckpointInfo> CheckpointTask => checkpointTcs.Task;
 
-        internal void CheckpointVersionShift(long oldVersion, long newVersion)
-            => checkpointManager.CheckpointVersionShift(oldVersion, newVersion);
+        internal void CheckpointVersionShiftStart(long oldVersion, long newVersion, bool isStreaming)
+            => checkpointManager.CheckpointVersionShiftStart(oldVersion, newVersion, isStreaming);
+
+        internal void CheckpointVersionShiftEnd(long oldVersion, long newVersion, bool isStreaming)
+            => checkpointManager.CheckpointVersionShiftEnd(oldVersion, newVersion, isStreaming);
 
         internal void WriteHybridLogMetaInfo()
         {
-            var metadata = _hybridLogCheckpoint.info.ToByteArray();
-            if (CommitCookie != null && CommitCookie.Length != 0)
-            {
-                var convertedCookie = Convert.ToBase64String(CommitCookie);
-                metadata = [.. metadata, .. Encoding.Default.GetBytes(convertedCookie)];
-            }
-            checkpointManager.CommitLogCheckpoint(_hybridLogCheckpointToken, metadata);
+            _hybridLogCheckpoint.info.cookie = checkpointManager.GetCookie();
+            checkpointManager.CommitLogCheckpointMetadata(_hybridLogCheckpointToken, _hybridLogCheckpoint.info.ToByteArray());
+        }
+
+        internal void CleanupLogCheckpoint()
+        {
+            checkpointManager.CleanupLogCheckpoint(_hybridLogCheckpointToken);
             Log.ShiftBeginAddress(_hybridLogCheckpoint.info.beginAddress, truncateLog: true);
         }
 
         internal void WriteHybridLogIncrementalMetaInfo(DeltaLog deltaLog)
         {
-            var metadata = _hybridLogCheckpoint.info.ToByteArray();
-            if (CommitCookie != null && CommitCookie.Length != 0)
-            {
-                var convertedCookie = Convert.ToBase64String(CommitCookie);
-                metadata = [.. metadata, .. Encoding.Default.GetBytes(convertedCookie)];
-            }
-            checkpointManager.CommitLogIncrementalCheckpoint(_hybridLogCheckpointToken, _hybridLogCheckpoint.info.version, metadata, deltaLog);
-            Log.ShiftBeginAddress(_hybridLogCheckpoint.info.beginAddress, truncateLog: true);
+            _hybridLogCheckpoint.info.cookie = checkpointManager.GetCookie();
+            checkpointManager.CommitLogIncrementalCheckpoint(_hybridLogCheckpointToken, _hybridLogCheckpoint.info.ToByteArray(), deltaLog);
+        }
+
+        internal void CleanupLogIncrementalCheckpoint()
+        {
+            checkpointManager.CleanupLogIncrementalCheckpoint(_hybridLogCheckpointToken);
         }
 
         internal void WriteIndexMetaInfo()
         {
             checkpointManager.CommitIndexCheckpoint(_indexCheckpointToken, _indexCheckpoint.info.ToByteArray());
+        }
+
+        internal void CleanupIndexCheckpoint()
+        {
+            checkpointManager.CleanupIndexCheckpoint(_indexCheckpointToken);
         }
 
         internal void InitializeIndexCheckpoint(Guid indexToken)

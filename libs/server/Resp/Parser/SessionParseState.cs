@@ -249,7 +249,7 @@ namespace Garnet.server
         /// </summary>
         /// <param name="i">Index of buffer at which to start setting arguments</param>
         /// <param name="args">Arguments to set</param>
-        public void SetArguments(int i, ReadOnlySpan<ArgSlice> args)
+        public void SetArguments(int i, params ReadOnlySpan<ArgSlice> args)
         {
             Debug.Assert(i + args.Length - 1 < Count);
             for (var j = 0; j < args.Length; j++)
@@ -415,10 +415,10 @@ namespace Garnet.server
         /// </summary>
         /// <returns></returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public double GetDouble(int i)
+        public double GetDouble(int i, bool canBeInfinite = true)
         {
             Debug.Assert(i < Count);
-            return ParseUtils.ReadDouble(ref Unsafe.AsRef<ArgSlice>(bufferPtr + i));
+            return ParseUtils.ReadDouble(ref Unsafe.AsRef<ArgSlice>(bufferPtr + i), canBeInfinite);
         }
 
         /// <summary>
@@ -426,10 +426,10 @@ namespace Garnet.server
         /// </summary>
         /// <returns>True if double parsed successfully</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool TryGetDouble(int i, out double value)
+        public bool TryGetDouble(int i, out double value, bool canBeInfinite = true)
         {
             Debug.Assert(i < Count);
-            return ParseUtils.TryReadDouble(ref Unsafe.AsRef<ArgSlice>(bufferPtr + i), out value);
+            return ParseUtils.TryReadDouble(ref Unsafe.AsRef<ArgSlice>(bufferPtr + i), out value, canBeInfinite);
         }
 
         /// <summary>

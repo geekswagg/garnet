@@ -56,7 +56,7 @@ namespace Garnet
             }
 
             // HSET
-            var status = api.HashSet(myHash, pairs.Take(pairs.Length - 2).ToArray(), out var count);
+            var status = api.HashSet(myHash, [.. pairs.Take(pairs.Length - 2)], out var count);
             if (status != GarnetStatus.OK || count != pairs.Length - 2)
                 return false;
 
@@ -119,6 +119,16 @@ namespace Garnet
             // HSCAN
             status = api.HashScan(myHash, 0, "age", 5, out var items);
             if (status != GarnetStatus.OK || items.Length != 3 || !items[1].ReadOnlySpan.StartsWith("age"u8))
+                return false;
+
+            // HGET (hashobject exists, field not found)
+            status = api.HashGet(myHash, ArgSlice.FromPinnedSpan("nonexistingfield"u8), out value);
+            if (status != GarnetStatus.OK || value.Length != 0)
+                return false;
+
+            // HGET (hashobject not found)
+            status = api.HashGet(ArgSlice.FromPinnedSpan("nonexistinghash"u8), pairs[0].field, out value);
+            if (status != GarnetStatus.NOTFOUND || value.Length != 0)
                 return false;
 
             return true;

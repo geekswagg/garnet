@@ -39,18 +39,33 @@
         ]
       },
       {
+        "Command": "ACL_GENPASS",
+        "Name": "ACL|GENPASS",
+        "Summary": "Generates a pseudorandom, secure password that can be used to identify ACL users.",
+        "Group": "Server",
+        "Complexity": "O(1)",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "BITS",
+            "DisplayText": "bits",
+            "Type": "Integer",
+            "ArgumentFlags": "Optional"
+          }
+        ]
+      },
+      {
         "Command": "ACL_GETUSER",
         "Name": "ACL|GETUSER",
-        "Summary": "Returns the rules defined for an ACL user.",
+        "Summary": "Lists the ACL rules of a user.",
         "Group": "Server",
-        "Complexity": "O(1) amortized time considering the typical user.",
+        "Complexity": "O(N). Where N is the number of password, command and pattern rules that the user has.",
         "Arguments": [
           {
             "TypeDiscriminator": "RespCommandBasicArgument",
             "Name": "USERNAME",
             "DisplayText": "username",
-            "Type": "String",
-            "ArgumentFlags": "Multiple"
+            "Type": "String"
           }
         ]
       },
@@ -213,6 +228,14 @@
         "DisplayText": "schedule",
         "Type": "PureToken",
         "Token": "SCHEDULE",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "DBID",
+        "DisplayText": "dbid",
+        "Type": "Integer",
+        "Token": "DBID",
         "ArgumentFlags": "Optional"
       }
     ]
@@ -1347,6 +1370,13 @@
         ]
       },
       {
+        "Command": "CLUSTER_FLUSHALL",
+        "Name": "CLUSTER|FLUSHALL",
+        "Summary": "Sent by primary to replica to force to FLUSH its database",
+        "Group": "Cluster",
+        "Complexity": "O(1)"
+      },
+      {
         "Command": "CLUSTER_FORGET",
         "Name": "CLUSTER|FORGET",
         "Summary": "Removes a node from the nodes table.",
@@ -1707,7 +1737,17 @@
     "Command": "COMMITAOF",
     "Name": "COMMITAOF",
     "Summary": "Commit to append-only file.",
-    "Group": "Server"
+    "Group": "Server",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "DBID",
+        "DisplayText": "dbid",
+        "Type": "Integer",
+        "Token": "DBID",
+        "ArgumentFlags": "Optional"
+      }
+    ]
   },
   {
     "Command": "CONFIG",
@@ -1879,6 +1919,28 @@
     ]
   },
   {
+    "Command": "DELIFGREATER",
+    "Name": "DELIFGREATER",
+    "Summary": "Deletes a key only if the provided Etag is strictly greater than the existing Etag for the key.",
+    "Group": "Generic",
+    "Complexity": "O(1)",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "ETAG",
+        "DisplayText": "etag",
+        "Type": "Integer"
+      }
+    ]
+  },
+  {
     "Command": "DISCARD",
     "Name": "DISCARD",
     "Summary": "Discards a transaction.",
@@ -2009,6 +2071,21 @@
         "Type": "Key",
         "ArgumentFlags": "Multiple",
         "KeySpecIndex": 0
+      }
+    ]
+  },
+  {
+    "Command": "EXPDELSCAN",
+    "Name": "EXPDELSCAN",
+    "Summary": "Scans mutable records to delete expired ones.",
+    "Group": "Generic",
+    "Complexity": "O(1) for every call. O(N) for a complete iteration. N is the number of records in memory.",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "DBID",
+        "DisplayText": "dbid",
+        "Type": "Integer"
       }
     ]
   },
@@ -2445,6 +2522,602 @@
         "DisplayText": "member",
         "Type": "String",
         "ArgumentFlags": "Optional, Multiple"
+      }
+    ]
+  },
+  {
+    "Command": "GEORADIUS",
+    "Name": "GEORADIUS",
+    "Summary": "Queries a geospatial index for members within a distance from a coordinate, optionally stores the result.",
+    "Group": "Geo",
+    "Complexity": "O(N\u002Blog(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+    "DocFlags": "Deprecated",
+    "ReplacedBy": "\u0060GEOSEARCH\u0060 and \u0060GEOSEARCHSTORE\u0060 with the \u0060BYRADIUS\u0060 argument",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "LONGITUDE",
+        "DisplayText": "longitude",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "LATITUDE",
+        "DisplayText": "latitude",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "RADIUS",
+        "DisplayText": "radius",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "UNIT",
+        "Type": "OneOf",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "M",
+            "DisplayText": "m",
+            "Type": "PureToken",
+            "Token": "M"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "KM",
+            "DisplayText": "km",
+            "Type": "PureToken",
+            "Token": "KM"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "FT",
+            "DisplayText": "ft",
+            "Type": "PureToken",
+            "Token": "FT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MI",
+            "DisplayText": "mi",
+            "Type": "PureToken",
+            "Token": "MI"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHCOORD",
+        "DisplayText": "withcoord",
+        "Type": "PureToken",
+        "Token": "WITHCOORD",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHDIST",
+        "DisplayText": "withdist",
+        "Type": "PureToken",
+        "Token": "WITHDIST",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHHASH",
+        "DisplayText": "withhash",
+        "Type": "PureToken",
+        "Token": "WITHHASH",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "COUNT-BLOCK",
+        "Type": "Block",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "COUNT",
+            "DisplayText": "count",
+            "Type": "Integer",
+            "Token": "COUNT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ANY",
+            "DisplayText": "any",
+            "Type": "PureToken",
+            "Token": "ANY",
+            "ArgumentFlags": "Optional"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "ORDER",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ASC",
+            "DisplayText": "asc",
+            "Type": "PureToken",
+            "Token": "ASC"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "DESC",
+            "DisplayText": "desc",
+            "Type": "PureToken",
+            "Token": "DESC"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "STORE",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandKeyArgument",
+            "Name": "STOREKEY",
+            "DisplayText": "key",
+            "Type": "Key",
+            "Token": "STORE",
+            "KeySpecIndex": 1
+          },
+          {
+            "TypeDiscriminator": "RespCommandKeyArgument",
+            "Name": "STOREDISTKEY",
+            "DisplayText": "key",
+            "Type": "Key",
+            "Token": "STOREDIST",
+            "KeySpecIndex": 2
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "GEORADIUS_RO",
+    "Name": "GEORADIUS_RO",
+    "Summary": "Returns members from a geospatial index that are within a distance from a coordinate.",
+    "Group": "Geo",
+    "Complexity": "O(N\u002Blog(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+    "DocFlags": "Deprecated",
+    "ReplacedBy": "\u0060GEOSEARCH\u0060 with the \u0060BYRADIUS\u0060 argument",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "LONGITUDE",
+        "DisplayText": "longitude",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "LATITUDE",
+        "DisplayText": "latitude",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "RADIUS",
+        "DisplayText": "radius",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "UNIT",
+        "Type": "OneOf",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "M",
+            "DisplayText": "m",
+            "Type": "PureToken",
+            "Token": "M"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "KM",
+            "DisplayText": "km",
+            "Type": "PureToken",
+            "Token": "KM"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "FT",
+            "DisplayText": "ft",
+            "Type": "PureToken",
+            "Token": "FT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MI",
+            "DisplayText": "mi",
+            "Type": "PureToken",
+            "Token": "MI"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHCOORD",
+        "DisplayText": "withcoord",
+        "Type": "PureToken",
+        "Token": "WITHCOORD",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHDIST",
+        "DisplayText": "withdist",
+        "Type": "PureToken",
+        "Token": "WITHDIST",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHHASH",
+        "DisplayText": "withhash",
+        "Type": "PureToken",
+        "Token": "WITHHASH",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "COUNT-BLOCK",
+        "Type": "Block",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "COUNT",
+            "DisplayText": "count",
+            "Type": "Integer",
+            "Token": "COUNT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ANY",
+            "DisplayText": "any",
+            "Type": "PureToken",
+            "Token": "ANY",
+            "ArgumentFlags": "Optional"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "ORDER",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ASC",
+            "DisplayText": "asc",
+            "Type": "PureToken",
+            "Token": "ASC"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "DESC",
+            "DisplayText": "desc",
+            "Type": "PureToken",
+            "Token": "DESC"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "GEORADIUSBYMEMBER",
+    "Name": "GEORADIUSBYMEMBER",
+    "Summary": "Queries a geospatial index for members within a distance from a member, optionally stores the result.",
+    "Group": "Geo",
+    "Complexity": "O(N\u002Blog(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+    "DocFlags": "Deprecated",
+    "ReplacedBy": "\u0060GEOSEARCH\u0060 and \u0060GEOSEARCHSTORE\u0060 with the \u0060BYRADIUS\u0060 and \u0060FROMMEMBER\u0060 arguments",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "MEMBER",
+        "DisplayText": "member",
+        "Type": "String"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "RADIUS",
+        "DisplayText": "radius",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "UNIT",
+        "Type": "OneOf",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "M",
+            "DisplayText": "m",
+            "Type": "PureToken",
+            "Token": "M"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "KM",
+            "DisplayText": "km",
+            "Type": "PureToken",
+            "Token": "KM"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "FT",
+            "DisplayText": "ft",
+            "Type": "PureToken",
+            "Token": "FT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MI",
+            "DisplayText": "mi",
+            "Type": "PureToken",
+            "Token": "MI"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHCOORD",
+        "DisplayText": "withcoord",
+        "Type": "PureToken",
+        "Token": "WITHCOORD",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHDIST",
+        "DisplayText": "withdist",
+        "Type": "PureToken",
+        "Token": "WITHDIST",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHHASH",
+        "DisplayText": "withhash",
+        "Type": "PureToken",
+        "Token": "WITHHASH",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "COUNT-BLOCK",
+        "Type": "Block",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "COUNT",
+            "DisplayText": "count",
+            "Type": "Integer",
+            "Token": "COUNT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ANY",
+            "DisplayText": "any",
+            "Type": "PureToken",
+            "Token": "ANY",
+            "ArgumentFlags": "Optional"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "ORDER",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ASC",
+            "DisplayText": "asc",
+            "Type": "PureToken",
+            "Token": "ASC"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "DESC",
+            "DisplayText": "desc",
+            "Type": "PureToken",
+            "Token": "DESC"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "STORE",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandKeyArgument",
+            "Name": "STOREKEY",
+            "DisplayText": "key",
+            "Type": "Key",
+            "Token": "STORE",
+            "KeySpecIndex": 1
+          },
+          {
+            "TypeDiscriminator": "RespCommandKeyArgument",
+            "Name": "STOREDISTKEY",
+            "DisplayText": "key",
+            "Type": "Key",
+            "Token": "STOREDIST",
+            "KeySpecIndex": 2
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "GEORADIUSBYMEMBER_RO",
+    "Name": "GEORADIUSBYMEMBER_RO",
+    "Summary": "Returns members from a geospatial index that are within a distance from a member.",
+    "Group": "Geo",
+    "Complexity": "O(N\u002Blog(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+    "DocFlags": "Deprecated",
+    "ReplacedBy": "\u0060GEOSEARCH\u0060 with the \u0060BYRADIUS\u0060 and \u0060FROMMEMBER\u0060 arguments",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "MEMBER",
+        "DisplayText": "member",
+        "Type": "String"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "RADIUS",
+        "DisplayText": "radius",
+        "Type": "Double"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "UNIT",
+        "Type": "OneOf",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "M",
+            "DisplayText": "m",
+            "Type": "PureToken",
+            "Token": "M"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "KM",
+            "DisplayText": "km",
+            "Type": "PureToken",
+            "Token": "KM"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "FT",
+            "DisplayText": "ft",
+            "Type": "PureToken",
+            "Token": "FT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MI",
+            "DisplayText": "mi",
+            "Type": "PureToken",
+            "Token": "MI"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHCOORD",
+        "DisplayText": "withcoord",
+        "Type": "PureToken",
+        "Token": "WITHCOORD",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHDIST",
+        "DisplayText": "withdist",
+        "Type": "PureToken",
+        "Token": "WITHDIST",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "WITHHASH",
+        "DisplayText": "withhash",
+        "Type": "PureToken",
+        "Token": "WITHHASH",
+        "ArgumentFlags": "Optional"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "COUNT-BLOCK",
+        "Type": "Block",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "COUNT",
+            "DisplayText": "count",
+            "Type": "Integer",
+            "Token": "COUNT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ANY",
+            "DisplayText": "any",
+            "Type": "PureToken",
+            "Token": "ANY",
+            "ArgumentFlags": "Optional"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "ORDER",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "ASC",
+            "DisplayText": "asc",
+            "Type": "PureToken",
+            "Token": "ASC"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "DESC",
+            "DisplayText": "desc",
+            "Type": "PureToken",
+            "Token": "DESC"
+          }
+        ]
       }
     ]
   },
@@ -3929,14 +4602,6 @@
         "Type": "Integer",
         "Token": "COUNT",
         "ArgumentFlags": "Optional"
-      },
-      {
-        "TypeDiscriminator": "RespCommandBasicArgument",
-        "Name": "NOVALUES",
-        "DisplayText": "novalues",
-        "Type": "PureToken",
-        "Token": "NOVALUES",
-        "ArgumentFlags": "Optional"
       }
     ]
   },
@@ -4175,7 +4840,17 @@
     "Name": "LASTSAVE",
     "Summary": "Returns the Unix timestamp of the last successful save to disk.",
     "Group": "Server",
-    "Complexity": "O(1)"
+    "Complexity": "O(1)",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "DBID",
+        "DisplayText": "dbid",
+        "Type": "Integer",
+        "Token": "DBID",
+        "ArgumentFlags": "Optional"
+      }
+    ]
   },
   {
     "Command": "LATENCY",
@@ -5852,7 +6527,17 @@
     "Name": "SAVE",
     "Summary": "Synchronously saves the database(s) to disk.",
     "Group": "Server",
-    "Complexity": "O(N) where N is the total number of keys in all databases"
+    "Complexity": "O(N) where N is the total number of keys in all databases",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "DBID",
+        "DisplayText": "dbid",
+        "Type": "Integer",
+        "Token": "DBID",
+        "ArgumentFlags": "Optional"
+      }
+    ]
   },
   {
     "Command": "SCAN",
@@ -6306,7 +6991,8 @@
         "Name": "NOGET",
         "DisplayText": "noget",
         "Type": "PureToken",
-        "Token": "NOGET"
+        "Token": "NOGET",
+        "ArgumentFlags": "Optional"
       }
     ]
   },
@@ -6363,7 +7049,8 @@
         "Name": "NOGET",
         "DisplayText": "noget",
         "Type": "PureToken",
-        "Token": "NOGET"
+        "Token": "NOGET",
+        "ArgumentFlags": "Optional"
       }
     ]
   },
@@ -6933,6 +7620,27 @@
     ]
   },
   {
+    "Command": "SWAPDB",
+    "Name": "SWAPDB",
+    "Summary": "Swaps two Redis databases.",
+    "Group": "Server",
+    "Complexity": "O(N) where N is the count of clients watching or blocking on keys from both databases.",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "INDEX1",
+        "DisplayText": "index1",
+        "Type": "Integer"
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "INDEX2",
+        "DisplayText": "index2",
+        "Type": "Integer"
+      }
+    ]
+  },
+  {
     "Command": "TIME",
     "Name": "TIME",
     "Summary": "Returns the server time.",
@@ -7175,6 +7883,12 @@
     ]
   },
   {
+    "Command": "ZCOLLECT",
+    "Name": "ZCOLLECT",
+    "Summary": "Manually trigger deletion of expired members from memory for SortedSet",
+    "Group": "Hash"
+  },
+  {
     "Command": "ZCOUNT",
     "Name": "ZCOUNT",
     "Summary": "Returns the count of members in a sorted set that have scores within a range.",
@@ -7260,6 +7974,201 @@
         "Type": "Key",
         "ArgumentFlags": "Multiple",
         "KeySpecIndex": 1
+      }
+    ]
+  },
+  {
+    "Command": "ZEXPIRE",
+    "Name": "ZEXPIRE",
+    "Summary": "Set expiry for sorted set member using relative time to expire (seconds)",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "SECONDS",
+        "DisplayText": "seconds",
+        "Type": "Integer"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "CONDITION",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NX",
+            "DisplayText": "nx",
+            "Type": "PureToken",
+            "Token": "NX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "XX",
+            "DisplayText": "xx",
+            "Type": "PureToken",
+            "Token": "XX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "GT",
+            "DisplayText": "gt",
+            "Type": "PureToken",
+            "Token": "GT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "LT",
+            "DisplayText": "lt",
+            "Type": "PureToken",
+            "Token": "LT"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "ZEXPIREAT",
+    "Name": "ZEXPIREAT",
+    "Summary": "Set expiry for sorted set member using an absolute Unix timestamp (seconds)",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "UNIX-TIME-SECONDS",
+        "DisplayText": "unix-time-seconds",
+        "Type": "UnixTime"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "CONDITION",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NX",
+            "DisplayText": "nx",
+            "Type": "PureToken",
+            "Token": "NX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "XX",
+            "DisplayText": "xx",
+            "Type": "PureToken",
+            "Token": "XX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "GT",
+            "DisplayText": "gt",
+            "Type": "PureToken",
+            "Token": "GT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "LT",
+            "DisplayText": "lt",
+            "Type": "PureToken",
+            "Token": "LT"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "ZEXPIRETIME",
+    "Name": "ZEXPIRETIME",
+    "Summary": "Returns the expiration time of a sorted set member as a Unix timestamp, in seconds.",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "FIELDS",
+        "Type": "Block",
+        "Token": "FIELDS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMFIELDS",
+            "DisplayText": "numfields",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "FIELD",
+            "DisplayText": "field",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
       }
     ]
   },
@@ -7563,6 +8472,238 @@
     ]
   },
   {
+    "Command": "ZPERSIST",
+    "Name": "ZPERSIST",
+    "Summary": "Removes the expiration time for each specified sorted set member",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "ZPEXPIRE",
+    "Name": "ZPEXPIRE",
+    "Summary": "Set expiry for sorted set member using relative time to expire (milliseconds)",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "MILLISECONDS",
+        "DisplayText": "milliseconds",
+        "Type": "Integer"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "CONDITION",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NX",
+            "DisplayText": "nx",
+            "Type": "PureToken",
+            "Token": "NX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "XX",
+            "DisplayText": "xx",
+            "Type": "PureToken",
+            "Token": "XX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "GT",
+            "DisplayText": "gt",
+            "Type": "PureToken",
+            "Token": "GT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "LT",
+            "DisplayText": "lt",
+            "Type": "PureToken",
+            "Token": "LT"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "ZPEXPIREAT",
+    "Name": "ZPEXPIREAT",
+    "Summary": "Set expiry for sorted set member using an absolute Unix timestamp (milliseconds)",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandBasicArgument",
+        "Name": "UNIX-TIME-MILLISECONDS",
+        "DisplayText": "unix-time-milliseconds",
+        "Type": "UnixTime"
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "CONDITION",
+        "Type": "OneOf",
+        "ArgumentFlags": "Optional",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NX",
+            "DisplayText": "nx",
+            "Type": "PureToken",
+            "Token": "NX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "XX",
+            "DisplayText": "xx",
+            "Type": "PureToken",
+            "Token": "XX"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "GT",
+            "DisplayText": "gt",
+            "Type": "PureToken",
+            "Token": "GT"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "LT",
+            "DisplayText": "lt",
+            "Type": "PureToken",
+            "Token": "LT"
+          }
+        ]
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "Command": "ZPEXPIRETIME",
+    "Name": "ZPEXPIRETIME",
+    "Summary": "Returns the expiration time of a sorted set member as a Unix timestamp, in msec.",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
+      }
+    ]
+  },
+  {
     "Command": "ZPOPMAX",
     "Name": "ZPOPMAX",
     "Summary": "Returns the highest-scoring members from a sorted set after removing them. Deletes the sorted set if the last member was popped.",
@@ -7605,6 +8746,43 @@
         "DisplayText": "count",
         "Type": "Integer",
         "ArgumentFlags": "Optional"
+      }
+    ]
+  },
+  {
+    "Command": "ZPTTL",
+    "Name": "ZPTTL",
+    "Summary": "Returns the TTL in milliseconds of a sorted set member.",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
       }
     ]
   },
@@ -8301,6 +9479,43 @@
         "Name": "MEMBER",
         "DisplayText": "member",
         "Type": "String"
+      }
+    ]
+  },
+  {
+    "Command": "ZTTL",
+    "Name": "ZTTL",
+    "Summary": "Returns the TTL in seconds of a sorted set member.",
+    "Group": "SortedSet",
+    "Complexity": "O(N) where N is the number of specified members",
+    "Arguments": [
+      {
+        "TypeDiscriminator": "RespCommandKeyArgument",
+        "Name": "KEY",
+        "DisplayText": "key",
+        "Type": "Key",
+        "KeySpecIndex": 0
+      },
+      {
+        "TypeDiscriminator": "RespCommandContainerArgument",
+        "Name": "MEMBERS",
+        "Type": "Block",
+        "Token": "MEMBERS",
+        "Arguments": [
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "NUMMEMBERS",
+            "DisplayText": "nummembers",
+            "Type": "Integer"
+          },
+          {
+            "TypeDiscriminator": "RespCommandBasicArgument",
+            "Name": "MEMBER",
+            "DisplayText": "member",
+            "Type": "String",
+            "ArgumentFlags": "Multiple"
+          }
+        ]
       }
     ]
   },

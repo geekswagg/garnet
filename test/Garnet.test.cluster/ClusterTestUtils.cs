@@ -7,12 +7,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Garnet.client;
 using Garnet.common;
+using Garnet.server.TLS;
 using GarnetClusterManagement;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
@@ -97,6 +99,8 @@ namespace Garnet.test.cluster
         OBJECT_STORE_RECOVERED_SAFE_AOF_ADDRESS,
         PRIMARY_SYNC_IN_PROGRESS,
         PRIMARY_FAILOVER_STATE,
+        RECOVER_STATUS,
+        LAST_FAILOVER_STATE,
     }
 
     public enum StoreInfoItem
@@ -123,19 +127,19 @@ namespace Garnet.test.cluster
         }
 
         public IPEndPoint[] GetEndpoints()
-            => endpoints.Select(x => (IPEndPoint)x).ToArray();
+            => [.. endpoints.Select(x => (IPEndPoint)x)];
 
         public IPEndPoint[] GetEndpointsWithout(IPEndPoint endPoint) =>
-            endpoints.Select(x => (IPEndPoint)x).Where(x => x.Port != endPoint.Port || x.Address != endPoint.Address).ToArray();
+            [.. endpoints.Select(x => (IPEndPoint)x).Where(x => x.Port != endPoint.Port || x.Address != endPoint.Address)];
 
-        public RedisResult Execute(IPEndPoint endPoint, string cmd, ICollection<object> args, bool skipLogging = false, ILogger logger = null)
+        public RedisResult Execute(IPEndPoint endPoint, string cmd, ICollection<object> args, bool skipLogging = false, ILogger logger = null, CommandFlags flags = CommandFlags.None)
         {
             if (!skipLogging)
                 logger?.LogInformation("({address}:{port}) > {cmd} {args}", endPoint.Address, endPoint.Port, cmd, string.Join(' ', args));
             try
             {
                 var server = GetServer(endPoint);
-                var resp = server.Execute(cmd, args);
+                var resp = server.Execute(cmd, args, flags: flags);
                 return resp;
             }
             catch (Exception ex)
@@ -146,7 +150,7 @@ namespace Garnet.test.cluster
         }
 
         public RedisResult NodesV2(IPEndPoint endPoint, ILogger logger = null)
-            => Execute(endPoint, "cluster", new List<object> { "nodes" }, skipLogging: true, logger);
+            => Execute(endPoint, "cluster", ["nodes"], skipLogging: true, logger);
 
         public string NodesMyself(IPEndPoint endPoint, ClusterInfoTag tag, ILogger logger)
         {
@@ -252,7 +256,7 @@ namespace Garnet.test.cluster
 
         private static List<(int, int)>[] GetSlotRanges(int primary_count)
         {
-            List<(int, int)>[] slotRanges = new List<(int, int)>[primary_count];
+            var slotRanges = new List<(int, int)>[primary_count];
             int slotCount = 16384;
 
             for (int i = 0; i < primary_count; i++)
@@ -584,6 +588,9 @@ namespace Garnet.test.cluster
             this.certificates = certificates;
         }
 
+        public int HashSlot(RedisKey key)
+        => redis.HashSlot(key);
+
         public static void BackOff(TimeSpan timeSpan = default) => Thread.Sleep(timeSpan == default ? backoff : timeSpan);
 
         public static void BackOff(CancellationToken cancellationToken, TimeSpan timeSpan = default, string msg = null)
@@ -593,10 +600,11 @@ namespace Garnet.test.cluster
             Thread.Sleep(timeSpan == default ? backoff : timeSpan);
         }
 
-        public void Connect(ILogger logger = null)
+        public void Connect(bool cluster = true, ILogger logger = null)
         {
             InitMultiplexer(GetRedisConfig(endpoints), textWriter, logger: logger);
-            this.nodeIds = GetNodeIds(logger: logger);
+            if (cluster)
+                this.nodeIds = GetNodeIds(logger: logger);
         }
 
         private void InitMultiplexer(ConfigurationOptions redisConfig, TextWriter textWriter, bool failAssert = true, ILogger logger = null)
@@ -634,6 +642,12 @@ namespace Garnet.test.cluster
         {
             redis?.Close(false);
             redis?.Dispose();
+
+            if (gcsConnections != null)
+            {
+                foreach (var gcs in gcsConnections)
+                    gcs?.Dispose();
+            }
         }
 
         public string[] GetNodeIds(List<int> nodes = null, ILogger logger = null)
@@ -679,16 +693,47 @@ namespace Garnet.test.cluster
 
         public IDatabase GetDatabase() => redis.GetDatabase(0);
 
-        public GarnetClientSession GetGarnetClientSession(int nodeIndex)
+        public GarnetClientSession GetGarnetClientSession(int nodeIndex, bool useTLS = false)
         {
             gcsConnections ??= new GarnetClientSession[endpoints.Count];
 
             if (gcsConnections[nodeIndex] == null)
             {
-                gcsConnections[nodeIndex] = new GarnetClientSession(GetEndPoint(nodeIndex), new());
+                SslClientAuthenticationOptions sslOptions = null;
+                if (useTLS)
+                {
+                    sslOptions = new SslClientAuthenticationOptions
+                    {
+                        ClientCertificates = [CertificateUtils.GetMachineCertificateByFile(certFile, certPassword)],
+                        TargetHost = "GarnetTest",
+                        AllowRenegotiation = false,
+                        RemoteCertificateValidationCallback = TestUtils.ValidateServerCertificate,
+                    };
+                }
+                gcsConnections[nodeIndex] = new GarnetClientSession(GetEndPoint(nodeIndex), new(), tlsOptions: sslOptions);
                 gcsConnections[nodeIndex].Connect();
             }
             return gcsConnections[nodeIndex];
+        }
+
+        public const string certFile = "testcert.pfx";
+        public const string certPassword = "placeholder";
+
+        public GarnetClientSession CreateGarnetClientSession(int nodeIndex, bool useTLS = false)
+        {
+            SslClientAuthenticationOptions sslOptions = null;
+            if (useTLS)
+            {
+                sslOptions = new SslClientAuthenticationOptions
+                {
+                    ClientCertificates = [CertificateUtils.GetMachineCertificateByFile(certFile, certPassword)],
+                    TargetHost = "GarnetTest",
+                    AllowRenegotiation = false,
+                    RemoteCertificateValidationCallback = TestUtils.ValidateServerCertificate,
+                };
+            }
+
+            return new(endpoints[nodeIndex], new(), tlsOptions: sslOptions);
         }
 
         public IServer GetServer(int nodeIndex) => redis.GetServer(GetEndPoint(nodeIndex));
@@ -718,6 +763,12 @@ namespace Garnet.test.cluster
             while (HashSlot(data) != slot) RandomBytes(ref data, startOffset, endOffset);
         }
 
+        public void RandomBytesRestrictedToSlot(ref Random r, ref byte[] data, int slot, int startOffset = -1, int endOffset = -1)
+        {
+            RandomBytes(ref data, startOffset, endOffset);
+            while (HashSlot(data) != slot) RandomBytes(ref r, ref data, startOffset, endOffset);
+        }
+
         public void InitRandom(int seed)
         {
             r = new Random(seed);
@@ -730,7 +781,7 @@ namespace Garnet.test.cluster
         {
             startOffset = startOffset == -1 ? 0 : startOffset;
             endOffset = endOffset == -1 ? data.Length : endOffset;
-            for (int i = startOffset; i < endOffset; i++)
+            for (var i = startOffset; i < endOffset; i++)
                 data[i] = ascii_chars[r.Next(ascii_chars.Length)];
         }
 
@@ -1050,7 +1101,7 @@ namespace Garnet.test.cluster
         public void WaitForConfigPropagation(int fromNode, List<int> nodes = null, ILogger logger = null)
         {
             if (nodes == null)
-                nodes = Enumerable.Range(0, endpoints.Count).ToList();
+                nodes = [.. Enumerable.Range(0, endpoints.Count)];
             var fromNodeConfig = ClusterNodes(fromNode, logger: logger);
             while (true)
             {
@@ -1419,7 +1470,7 @@ namespace Garnet.test.cluster
                 var server = redis.GetServer((IPEndPoint)endpoints[nodeIndex]);
                 var resp = server.Execute("cluster", "getkeysinslot", $"{slot}", $"{keyCount}");
 
-                return ((RedisResult[])resp).Select(x => Encoding.ASCII.GetBytes((string)x)).ToList();
+                return [.. ((RedisResult[])resp).Select(x => Encoding.ASCII.GetBytes((string)x))];
             }
             catch (Exception ex)
             {
@@ -1699,6 +1750,13 @@ namespace Garnet.test.cluster
             return null;
         }
 
+        public void MigrateSlotsIndex(int sourceNodeIndex, int targetNodeIndex, List<int> slots, bool range = false, string authPassword = null, ILogger logger = null)
+        {
+            var srcPort = GetPortFromNodeIndex(sourceNodeIndex);
+            var dstPort = GetPortFromNodeIndex(targetNodeIndex);
+            MigrateSlots(srcPort, dstPort, slots, range, authPassword, logger);
+        }
+
         public void MigrateSlots(int sourcePort, int targetPort, List<int> slots, bool range = false, string authPassword = null, ILogger logger = null)
         {
             var sourceEndPoint = GetEndPointFromPort(sourcePort);
@@ -1748,7 +1806,7 @@ namespace Garnet.test.cluster
             {
                 target.Address.ToString(),
                 target.Port,
-                $"\"\"",
+                $"",
                 0,
                 -1,
                 "KEYS"
@@ -1879,10 +1937,10 @@ namespace Garnet.test.cluster
             }
         }
 
-        public string ClusterReplicate(int replicaNodeIndex, int primaryNodeIndex, ILogger logger = null)
+        public string ClusterReplicate(int replicaNodeIndex, int primaryNodeIndex, bool async = false, bool failEx = true, ILogger logger = null)
         {
             var primaryId = ClusterMyId(primaryNodeIndex, logger: logger);
-            return ClusterReplicate(replicaNodeIndex, primaryId, logger: logger);
+            return ClusterReplicate(replicaNodeIndex, primaryId, async: async, failEx: failEx, logger: logger);
         }
 
         public string ClusterReplicate(int sourceNodeIndex, string primaryNodeId, bool async = false, bool failEx = true, ILogger logger = null)
@@ -1893,7 +1951,7 @@ namespace Garnet.test.cluster
             try
             {
                 var server = redis.GetServer(endPoint);
-                List<object> args = async ? ["replicate", primaryNodeId, "async"] : ["replicate", primaryNodeId];
+                List<object> args = async ? ["replicate", primaryNodeId, "async"] : ["replicate", primaryNodeId, "sync"];
                 var result = (string)server.Execute("cluster", args);
                 ClassicAssert.AreEqual("OK", result);
                 return result;
@@ -2048,6 +2106,23 @@ namespace Garnet.test.cluster
                 logger?.LogError(ex, "An error has occurred; FlushAllDatabases");
                 Assert.Fail();
             }
+        }
+
+        public string ClusterStatus(int[] nodeIndices)
+        {
+            var clusterStatus = "";
+            foreach (var index in nodeIndices)
+                clusterStatus += $"{GetNodeInfo(ClusterNodes(index))}\n";
+
+            static string GetNodeInfo(ClusterConfiguration nodeConfig)
+            {
+                var output = $"[{nodeConfig.Origin}]";
+
+                foreach (var node in nodeConfig.Nodes)
+                    output += $"\n\t{node.Raw}";
+                return output;
+            }
+            return clusterStatus;
         }
 
         public ClusterConfiguration ClusterNodes(int nodeIndex, ILogger logger = null)
@@ -2371,7 +2446,7 @@ namespace Garnet.test.cluster
             try
             {
                 var result = server.Execute("mget", args, CommandFlags.NoRedirect);
-                getResult = ((RedisResult[])result).Select(x => (byte[])x).ToList();
+                getResult = [.. ((RedisResult[])result).Select(x => (byte[])x)];
                 return "OK";
             }
             catch (Exception e)
@@ -2657,7 +2732,7 @@ namespace Garnet.test.cluster
             }
         }
 
-        private List<(ReplicationInfoItem, string)> GetReplicationInfo(int nodeIndex, ReplicationInfoItem[] infoItems, ILogger logger = null)
+        public List<(ReplicationInfoItem, string)> GetReplicationInfo(int nodeIndex, ReplicationInfoItem[] infoItems, ILogger logger = null)
             => GetReplicationInfo((IPEndPoint)endpoints[nodeIndex], infoItems, logger);
 
         private List<(ReplicationInfoItem, string)> GetReplicationInfo(IPEndPoint endPoint, ReplicationInfoItem[] infoItems, ILogger logger = null)
@@ -2665,7 +2740,6 @@ namespace Garnet.test.cluster
             var server = redis.GetServer(endPoint);
             try
             {
-                //var result = (string)server.Execute("info", "replication");
                 var result = server.InfoRawAsync("replication").Result;
                 return ProcessReplicationInfo(result, infoItems);
             }
@@ -2728,6 +2802,14 @@ namespace Garnet.test.cluster
                             startsWith = "master_failover_state:";
                             if (item.StartsWith(startsWith)) items.Add((ii, item.Split(startsWith)[1].Trim()));
                             continue;
+                        case ReplicationInfoItem.RECOVER_STATUS:
+                            startsWith = "recover_status:";
+                            if (item.StartsWith(startsWith)) items.Add((ii, item.Split(startsWith)[1].Trim()));
+                            break;
+                        case ReplicationInfoItem.LAST_FAILOVER_STATE:
+                            startsWith = "last_failover_state:";
+                            if (item.StartsWith(startsWith)) items.Add((ii, item.Split(startsWith)[1].Trim()));
+                            break;
                         default:
                             Assert.Fail($"type {infoItem} not supported!");
                             return null;
@@ -2778,7 +2860,6 @@ namespace Garnet.test.cluster
             return fields;
         }
 
-
         public string GetInfo(int nodeIndex, string section, string segment, ILogger logger = null)
             => GetInfo(endpoints[nodeIndex].ToIPEndPoint(), section, segment, logger);
 
@@ -2803,12 +2884,14 @@ namespace Garnet.test.cluster
             }
         }
 
-        public void WaitForReplicaAofSync(int primaryIndex, int secondaryIndex, ILogger logger = null)
+        public void WaitForReplicaAofSync(int primaryIndex, int secondaryIndex, ILogger logger = null, CancellationToken cancellation = default)
         {
             long primaryReplicationOffset;
             long secondaryReplicationOffset1;
             while (true)
             {
+                cancellation.ThrowIfCancellationRequested();
+
                 primaryReplicationOffset = GetReplicationOffset(primaryIndex, logger);
                 secondaryReplicationOffset1 = GetReplicationOffset(secondaryIndex, logger);
                 if (primaryReplicationOffset == secondaryReplicationOffset1)
@@ -2874,6 +2957,27 @@ namespace Garnet.test.cluster
             {
                 var failoverState = GetFailoverState(nodeIndex, logger);
                 if (failoverState.Equals("no-failover")) break;
+                BackOff(cancellationToken: context.cts.Token);
+            }
+        }
+
+        public void WaitForFailoverCompleted(int nodeIndex, ILogger logger = null)
+        {
+            while (true)
+            {
+                var infoItem = context.clusterTestUtils.GetReplicationInfo(nodeIndex, [ReplicationInfoItem.LAST_FAILOVER_STATE], logger: context.logger);
+                if (infoItem[0].Item2.Equals("failover-completed"))
+                    break;
+                BackOff(cancellationToken: context.cts.Token, msg: nameof(WaitForFailoverCompleted));
+            }
+        }
+
+        public void WaitForPrimaryRole(int nodeIndex, ILogger logger = null)
+        {
+            while (true)
+            {
+                var role = RoleCommand(nodeIndex, logger);
+                if (role.Value.Equals("master")) break;
                 BackOff(cancellationToken: context.cts.Token);
             }
         }

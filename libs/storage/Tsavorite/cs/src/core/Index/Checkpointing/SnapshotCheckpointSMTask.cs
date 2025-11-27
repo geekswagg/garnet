@@ -34,9 +34,8 @@ namespace Tsavorite.core
 
                 case Phase.WAIT_FLUSH:
                     base.GlobalBeforeEnteringState(next, stateMachineDriver);
-                    store._hybridLogCheckpoint.info.finalLogicalAddress = store.hlogBase.GetTailAddress();
-                    store._hybridLogCheckpoint.info.snapshotFinalLogicalAddress = store._hybridLogCheckpoint.info.finalLogicalAddress;
 
+                    store._hybridLogCheckpoint.info.snapshotFinalLogicalAddress = store._hybridLogCheckpoint.info.finalLogicalAddress;
                     store._hybridLogCheckpoint.snapshotFileDevice =
                         store.checkpointManager.GetSnapshotLogDevice(store._hybridLogCheckpointToken);
                     store._hybridLogCheckpoint.snapshotFileObjectLogDevice =
@@ -46,6 +45,12 @@ namespace Tsavorite.core
 
                     // If we are using a NullDevice then storage tier is not enabled and FlushedUntilAddress may be ReadOnlyAddress; get all records in memory.
                     store._hybridLogCheckpoint.info.snapshotStartFlushedLogicalAddress = store.hlogBase.IsNullDevice ? store.hlogBase.HeadAddress : store.hlogBase.FlushedUntilAddress;
+
+                    if (store._hybridLogCheckpoint.info.finalLogicalAddress <= store._hybridLogCheckpoint.info.snapshotStartFlushedLogicalAddress)
+                    {
+                        // Nothing to flush because the flushed region already contains everything up to finalLogicalAddress.
+                        break;
+                    }
 
                     long startPage = store.hlogBase.GetPage(store._hybridLogCheckpoint.info.snapshotStartFlushedLogicalAddress);
                     long endPage = store.hlogBase.GetPage(store._hybridLogCheckpoint.info.finalLogicalAddress);

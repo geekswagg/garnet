@@ -15,6 +15,12 @@ using StackExchange.Redis;
 
 namespace Garnet.test.cluster
 {
+    public enum InstanceType
+    {
+        Standalone,
+        Cluster
+    }
+
     [TestFixture, NonParallelizable]
     public class ClusterManagementTests
     {
@@ -532,8 +538,8 @@ namespace Garnet.test.cluster
                 var replicaList = (string)context.clusterTestUtils.Execute((IPEndPoint)context.endpoints[nodeIx], "CLIENT", ["LIST", "TYPE", "REPLICA"]);
                 var masterList = (string)context.clusterTestUtils.Execute((IPEndPoint)context.endpoints[nodeIx], "CLIENT", ["LIST", "TYPE", "MASTER"]);
 
-                ClassicAssert.AreEqual(numReplica, replicaList.Split("\n").Length, $"nodeIx={nodeIx}, normal={numNormal}, replica={numReplica}, master={numMaster}");
-                ClassicAssert.AreEqual(numMaster, masterList.Split("\n").Length, $"nodeIx={nodeIx}, normal={numNormal}, replica={numReplica}, master={numMaster}");
+                ClassicAssert.AreEqual(numReplica, replicaList.Split("\n", StringSplitOptions.RemoveEmptyEntries).Length, $"nodeIx={nodeIx}, normal={numNormal}, replica={numReplica}, master={numMaster}");
+                ClassicAssert.AreEqual(numMaster, masterList.Split("\n", StringSplitOptions.RemoveEmptyEntries).Length, $"nodeIx={nodeIx}, normal={numNormal}, replica={numReplica}, master={numMaster}");
             }
 
             ClassicAssert.AreEqual(2, numWithTwoMasterConnections);
@@ -783,6 +789,100 @@ namespace Garnet.test.cluster
                 for (var j = 0; j < node_count; j++)
                     if (i != j)
                         context.clusterTestUtils.WaitUntilNodeIsKnown(i, j, context.logger);
+        }
+
+        [Test, Order(14)]
+        public void ClusterFlushAll()
+        {
+            var node_count = 2;
+            var primaryIndex = 0;
+            var replicaIndex = 1;
+            context.CreateInstances(node_count, enableAOF: true);
+            context.CreateConnection();
+            var (_, _) = context.clusterTestUtils.SimpleSetupCluster(primary_count: 1, replica_count: 1, logger: context.logger);
+
+            var key = "mykey";
+            var value = "myvalue";
+
+            // Set value
+            var result = (string)context.clusterTestUtils.GetServer(primaryIndex).Execute("SET", key, value);
+            ClassicAssert.AreEqual("OK", result);
+
+            // Get value
+            result = (string)context.clusterTestUtils.GetServer(primaryIndex).Execute("GET", key);
+            ClassicAssert.AreEqual(value, result);
+
+            // Get value from replica
+            while (true)
+            {
+                result = (string)context.clusterTestUtils.GetServer(replicaIndex).Execute("GET", key);
+                if (result == value)
+                    break;
+            }
+            ClassicAssert.AreEqual(value, result);
+
+            // Try to flushall on replica
+            var exception = Assert.Throws<RedisServerException>(() => context.clusterTestUtils.GetServer(replicaIndex).FlushAllDatabases());
+            ClassicAssert.AreEqual("ERR You can't write against a read only replica.", exception.Message);
+
+            // Flushall on primary
+            Assert.DoesNotThrow(() => context.clusterTestUtils.GetServer(primaryIndex).FlushAllDatabases());
+
+            // Get value
+            result = (string)context.clusterTestUtils.GetServer(primaryIndex).Execute("GET", key);
+            ClassicAssert.IsNull(result);
+
+            // Get value from replica
+            while (true)
+            {
+                result = (string)context.clusterTestUtils.GetServer(replicaIndex).Execute("GET", key);
+                if (result == null)
+                    break;
+            }
+            ClassicAssert.IsNull(result);
+        }
+
+        [Test, Order(15)]
+        public void ClusterCheckpointUpgradeFrom([Values] InstanceType instanceType)
+        {
+            // Startup in cluster or standalone mode
+            var isCluster = instanceType == InstanceType.Cluster;
+            context.CreateInstances(1, enableCluster: isCluster);
+            context.CreateConnection(enabledCluster: isCluster);
+
+            // If cluster mode assign slots
+            if (isCluster)
+                ClassicAssert.AreEqual("OK", context.clusterTestUtils.AddDelSlotsRange(0, [(0, 16383)], addslot: true, context.logger));
+
+            var keyLength = 32;
+            var kvpairCount = 128;
+            Dictionary<string, int> kvPairs = [];
+            context.PopulatePrimary(ref kvPairs, keyLength, kvpairCount, 0);
+
+            var primaryLastSaveTime = context.clusterTestUtils.LastSave(0, logger: context.logger);
+            context.clusterTestUtils.Checkpoint(0, context.logger);
+            context.clusterTestUtils.WaitCheckpoint(0, primaryLastSaveTime, logger: context.logger);
+
+            context.nodes[0].Dispose(false);
+            // Restart in standalone or cluster mode
+            context.nodes[0] = context.CreateInstance(context.clusterTestUtils.GetEndPoint(0), enableCluster: !isCluster, tryRecover: true);
+            context.nodes[0].Start();
+            context.CreateConnection(enabledCluster: !isCluster);
+
+            // Assign slot if started initially in standalone
+            if (!isCluster)
+                ClassicAssert.AreEqual("OK", context.clusterTestUtils.AddDelSlotsRange(0, [(0, 16383)], addslot: true, context.logger));
+
+            context.clusterTestUtils.PingAll(logger: context.logger);
+
+            var db = context.clusterTestUtils.GetDatabase();
+            foreach (var kv in kvPairs)
+            {
+                var key = kv.Key;
+                var value = kv.Value;
+                var dbValue = (int)db.StringGet(key);
+                ClassicAssert.AreEqual(value, dbValue);
+            }
         }
     }
 }
