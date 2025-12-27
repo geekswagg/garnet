@@ -43,6 +43,8 @@ namespace Garnet.server
                     SortedSetOperation.ZREMRANGEBYLEX => false,
                     SortedSetOperation.ZREMRANGEBYSCORE => false,
                     SortedSetOperation.ZREMRANGEBYRANK => false,
+                    SortedSetOperation.ZEXPIRE => false,
+                    SortedSetOperation.ZCOLLECT => false,
                     _ => true,
                 },
                 GarnetObjectType.List => header.ListOp switch
@@ -73,7 +75,6 @@ namespace Garnet.server
                     _ => true,
                 },
                 GarnetObjectType.Expire => false,
-                GarnetObjectType.PExpire => false,
                 GarnetObjectType.Persist => false,
                 _ => true,
             };

@@ -168,7 +168,7 @@ namespace Garnet.cluster
                 return true;
             }
 
-            logger?.LogTrace("CLUSTER MEET {ipaddressStr} {port}", ipAddress, port);
+            logger?.LogTrace("CLUSTER MEET");
             clusterProvider.clusterManager.RunMeetTask(ipAddress, port);
             while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
                 SendAndReset();
@@ -331,7 +331,7 @@ namespace Garnet.cluster
                 return true;
             }
 
-            var shardsInfo = clusterProvider.clusterManager.CurrentConfig.GetShardsInfo();
+            var shardsInfo = clusterProvider.clusterManager.CurrentConfig.GetShardsInfo(clusterProvider.clusterManager.clusterConnectionStore);
             while (!RespWriteUtils.TryWriteAsciiDirect(shardsInfo, ref dcurr, dend))
                 SendAndReset();
 
@@ -402,6 +402,12 @@ namespace Garnet.cluster
             {
                 while (!RespWriteUtils.TryWriteBulkString([], ref dcurr, dend))
                     SendAndReset();
+            }
+
+            // After each GOSSIP, ensure cluster connections for replication are in a good state
+            if (Server is GarnetServerBase garnetServer)
+            {
+                clusterProvider.replicationManager.EnsureReplication(this, garnetServer.ActiveClusterSessions());
             }
 
             return true;

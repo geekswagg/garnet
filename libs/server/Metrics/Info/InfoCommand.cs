@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 using System.Collections.Generic;
+using System.Text;
 using Garnet.common;
 
 namespace Garnet.server
@@ -62,17 +63,16 @@ namespace Garnet.server
             }
             else
             {
-                var sectionsArr = sections == null ? GarnetInfoMetrics.defaultInfo : [.. sections];
+                var sectionsArr = sections == null ? GarnetInfoMetrics.DefaultInfo : [.. sections];
                 var garnetInfo = new GarnetInfoMetrics();
-                var info = garnetInfo.GetRespInfo(sectionsArr, storeWrapper);
+                var info = garnetInfo.GetRespInfo(sectionsArr, activeDbId, storeWrapper);
                 if (!string.IsNullOrEmpty(info))
                 {
-                    while (!RespWriteUtils.TryWriteAsciiBulkString(info, ref dcurr, dend))
-                        SendAndReset();
+                    WriteVerbatimString(Encoding.ASCII.GetBytes(info));
                 }
                 else
                 {
-                    while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_ERRNOTFOUND, ref dcurr, dend))
+                    while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_EMPTY, ref dcurr, dend))
                         SendAndReset();
                 }
             }

@@ -238,6 +238,7 @@ namespace Garnet.test
             TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
             server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir,
                 disablePubSub: true,
+                enableModuleCommand: Garnet.server.Auth.Settings.ConnectionProtectionOption.Yes,
                 extensionBinPaths: [_extTestDir1, _extTestDir2],
                 extensionAllowUnsignedAssemblies: true);
             server.Start();
@@ -505,6 +506,28 @@ namespace Garnet.test
         }
 
         [Test]
+        public async Task CustomCommandCaseInsensitiveTest()
+        {
+            server.Register.NewCommand("A.SETIFPM", CommandType.ReadModifyWrite, new SetIfPMCustomCommand(), new RespCommandsInfo { Arity = 4 });
+
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            var key = "mykey";
+            var origValue = "foovalue0";
+            c.Execute("SET", key, origValue);
+
+            var newValue1 = "foovalue1";
+            var response = await c.ExecuteAsync("a.setifpm", key, newValue1, "foo");
+            // Test the command was recognized.
+            ClassicAssert.AreEqual("OK", response);
+
+            // Test the command did something.
+            var retValue = await c.ExecuteAsync("GET", key);
+            ClassicAssert.AreEqual(newValue1, retValue);
+        }
+
+        [Test]
         public void CustomObjectCommandTest1()
         {
             // Register sample custom command on object
@@ -682,7 +705,7 @@ namespace Garnet.test
             server.Register.NewCommand("MYDICTGET", CommandType.Read, factory, new MyDictGet(), new RespCommandsInfo { Arity = 3 });
 
             // Register sample custom command on object 2
-            var jsonFactory = new JsonObjectFactory();
+            var jsonFactory = new GarnetJsonObjectFactory();
             server.Register.NewCommand("JSON.SET", CommandType.ReadModifyWrite, jsonFactory, new JsonSET());
             server.Register.NewCommand("JSON.GET", CommandType.Read, jsonFactory, new JsonGET());
 
@@ -709,7 +732,7 @@ namespace Garnet.test
             // Test custom commands of object 2
             db.Execute("JSON.SET", "k1", "$", "{\"f1\": {\"a\":1}, \"f2\":{\"a\":2}}");
             var result = db.Execute("JSON.GET", "k1");
-            ClassicAssert.AreEqual("[{\"f1\":{\"a\":1},\"f2\":{\"a\":2}}]", result.ToString());
+            ClassicAssert.AreEqual("{\"f1\":{\"a\":1},\"f2\":{\"a\":2}}", result.ToString());
         }
 
         [Test]
@@ -1021,7 +1044,7 @@ namespace Garnet.test
             }
             catch (RedisServerException rse)
             {
-                ClassicAssert.AreEqual(Encoding.ASCII.GetString(CmdStrings.RESP_ERR_GENERIC_MALFORMED_REGISTERCS_COMMAND), rse.Message);
+                ClassicAssert.AreEqual(Encoding.ASCII.GetBytes(string.Format(CmdStrings.GenericErrWrongNumArgs, "REGISTERCS")), rse.Message);
             }
             ClassicAssert.IsNull(resp);
 
@@ -1258,7 +1281,7 @@ namespace Garnet.test
                 }
             }
 
-            if (!sync) Task.WhenAll(regCmdTasks);
+            if (!sync) Task.WaitAll(regCmdTasks);
 
             for (var i = 0; i < regCount; i++)
             {
@@ -1356,16 +1379,10 @@ namespace Garnet.test
                 server.Register.NewTransactionProc($"GETTWOKEYSNOTXN{i + 1}", () => new GetTwoKeysNoTxn(), new RespCommandsInfo { Arity = 3 });
             }
 
-            try
-            {
-                // This register should fail as there could only be byte.MaxValue + 1 transactions registered
-                server.Register.NewTransactionProc($"GETTWOKEYSNOTXN{byte.MaxValue + 3}", () => new GetTwoKeysNoTxn(), new RespCommandsInfo { Arity = 3 });
-                Assert.Fail();
-            }
-            catch (Exception e)
-            {
-                ClassicAssert.AreEqual("Out of registration space", e.Message);
-            }
+            // This register should fail as there could only be byte.MaxValue + 1 transactions registered
+            var e = Assert.Throws<Exception>(() => server.Register.NewTransactionProc($"GETTWOKEYSNOTXN{byte.MaxValue + 3}", () => new GetTwoKeysNoTxn(), new RespCommandsInfo { Arity = 3 }));
+
+            ClassicAssert.AreEqual("Out of registration space", e.Message);
 
             for (var i = 0; i < regCount; i++)
             {
@@ -1396,16 +1413,9 @@ namespace Garnet.test
                 server.Register.NewProcedure($"SUM{i + 1}", () => new Sum());
             }
 
-            try
-            {
-                // This register should fail as there could only be byte.MaxValue + 1 procedures registered
-                server.Register.NewProcedure($"SUM{byte.MaxValue + 3}", () => new Sum());
-                Assert.Fail();
-            }
-            catch (Exception e)
-            {
-                ClassicAssert.AreEqual("Out of registration space", e.Message);
-            }
+            // This register should fail as there could only be byte.MaxValue + 1 procedures registered
+            var e = Assert.Throws<Exception>(() => server.Register.NewProcedure($"SUM{byte.MaxValue + 3}", () => new Sum()));
+            ClassicAssert.AreEqual("Out of registration space", e.Message);
 
             db.StringSet("key1", "10");
             db.StringSet("key2", "35");

@@ -24,13 +24,14 @@ namespace Garnet.server
         readonly StoreWrapper storeWrapper;
         readonly ScratchBufferNetworkSender scratchBufferNetworkSender;
         readonly ILogger logger;
-        readonly Dictionary<ScriptHashKey, LuaRunner> scriptCache = [];
+        readonly Dictionary<ScriptHashKey, (LuaRunner Runner, LuaScriptHandle Handle)> scriptCache = [];
         readonly byte[] hash = new byte[SHA1Len / 2];
 
         readonly LuaMemoryManagementMode memoryManagementMode;
         readonly int? memoryLimitBytes;
         readonly LuaTimeoutManager timeoutManager;
         readonly LuaLoggingMode logMode;
+        readonly HashSet<string> allowedFunctions;
 
         LuaRunner timeoutRunningScript;
         LuaTimeoutManager.Registration timeoutRegistration;
@@ -57,6 +58,7 @@ namespace Garnet.server
             memoryManagementMode = storeWrapper.serverOptions.LuaOptions.MemoryManagementMode;
             memoryLimitBytes = storeWrapper.serverOptions.LuaOptions.GetMemoryLimitBytes();
             logMode = storeWrapper.serverOptions.LuaOptions.LogMode;
+            allowedFunctions = storeWrapper.serverOptions.LuaOptions.AllowedFunctions;
         }
 
         public void Dispose()
@@ -116,29 +118,57 @@ namespace Garnet.server
         /// <summary>
         /// Try get script runner for given digest
         /// </summary>
-        public bool TryGetFromDigest(ScriptHashKey digest, out LuaRunner scriptRunner)
-        => scriptCache.TryGetValue(digest, out scriptRunner);
+        public bool TryGetFromDigest(ScriptHashKey digest, out LuaRunner scriptRunner, out LuaScriptHandle scriptHandle)
+        {
+            if (!scriptCache.TryGetValue(digest, out var loadedTuple))
+            {
+                scriptRunner = null;
+                scriptHandle = null;
+                return false;
+            }
+
+            (scriptRunner, scriptHandle) = loadedTuple;
+
+            // If the global cache has been invalidated, remove from the session cache
+            if (scriptHandle.IsDisposed)
+            {
+                _ = scriptCache.Remove(digest);
+                scriptRunner.Dispose();
+
+                scriptRunner = null;
+                scriptHandle = null;
+                return false;
+            }
+
+            return true;
+        }
 
         /// <summary>
         /// Load script into the cache.
         /// 
         /// If necessary, <paramref name="digestOnHeap"/> will be set so the allocation can be reused.
         /// </summary>
-        internal bool TryLoad(RespServerSession session, ReadOnlySpan<byte> source, ScriptHashKey digest, out LuaRunner runner, out ScriptHashKey? digestOnHeap, out string error)
+        internal bool TryLoad(
+            RespServerSession session,
+            ReadOnlySpan<byte> source,
+            ScriptHashKey digest,
+            ref LuaScriptHandle luaScriptHandle,
+            out LuaRunner runner,
+            out ScriptHashKey? digestOnHeap
+        )
         {
-            error = null;
-
-            if (scriptCache.TryGetValue(digest, out runner))
+            if (TryGetFromDigest(digest, out runner, out var existingLuaScriptHandle))
             {
+                luaScriptHandle = existingLuaScriptHandle;
                 digestOnHeap = null;
                 return true;
             }
 
             try
             {
-                var sourceOnHeap = source.ToArray();
+                var compiledSource = LuaRunner.CompileSource(source);
 
-                runner = new LuaRunner(memoryManagementMode, memoryLimitBytes, logMode, sourceOnHeap, storeWrapper.serverOptions.LuaTransactionMode, processor, scratchBufferNetworkSender, storeWrapper.redisProtocolVersion, logger);
+                runner = new LuaRunner(memoryManagementMode, memoryLimitBytes, logMode, allowedFunctions, compiledSource, storeWrapper.serverOptions.LuaTransactionMode, processor, scratchBufferNetworkSender, storeWrapper.redisProtocolVersion, logger);
 
                 // If compilation fails, an error is written out
                 if (runner.CompileForSession(session))
@@ -154,7 +184,8 @@ namespace Garnet.server
                     ScriptHashKey storeKeyDigest = new(into);
                     digestOnHeap = storeKeyDigest;
 
-                    _ = scriptCache.TryAdd(storeKeyDigest, runner);
+                    luaScriptHandle ??= new(compiledSource);
+                    scriptCache.Add(storeKeyDigest, (runner, luaScriptHandle));
 
                     // On first script load, register for timeout notifications
                     //
@@ -174,12 +205,28 @@ namespace Garnet.server
             }
             catch (Exception ex)
             {
-                error = ex.Message;
+                logger?.LogError(ex, "During Lua script loading, an unexpected exception");
+
                 digestOnHeap = null;
+                luaScriptHandle = null;
                 return false;
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Attempt to remove the script with the given hash from the cache.
+        /// </summary>
+        internal void Remove(ScriptHashKey key)
+        {
+            if (scriptCache.Remove(key, out var loadedTuple))
+            {
+                // Intentionally NOT disposing the script handle
+                //
+                // Removing from a session cache does not invalidate the global cache
+                loadedTuple.Runner.Dispose();
+            }
         }
 
         /// <summary>
@@ -190,13 +237,25 @@ namespace Garnet.server
             timeoutRegistration?.Dispose();
             timeoutRegistration = null;
 
-            foreach (var runner in scriptCache.Values)
+            foreach (var (runner, _) in scriptCache.Values)
             {
+                // Intentionally NOT disposing the script handles
+                //
+                // Removing from a session cache does not invalidate the global cache
                 runner.Dispose();
             }
 
             scriptCache.Clear();
         }
+
+        /// <summary>
+        /// Swap database sessions in processor session
+        /// </summary>
+        /// <param name="dbId1">First database ID</param>
+        /// <param name="dbId2">Second database ID</param>
+        /// <returns>True if successful</returns>
+        internal bool TrySwapDatabaseSessions(int dbId1, int dbId2) =>
+            processor.TrySwapDatabaseSessions(dbId1, dbId2);
 
         static ReadOnlySpan<byte> HEX_CHARS => "0123456789abcdef"u8;
 

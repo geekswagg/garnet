@@ -32,7 +32,9 @@ namespace Garnet.test.Resp.ACL
         public void Setup()
         {
             TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
-            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, defaultPassword: DefaultPassword, useAcl: true, enableLua: true);
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, defaultPassword: DefaultPassword,
+                                                  useAcl: true, enableLua: true,
+                                                  enableModuleCommand: Garnet.server.Auth.Settings.ConnectionProtectionOption.Yes);
 
             // Register custom commands so we can test ACL'ing them
             ClassicAssert.IsTrue(TestUtils.TryGetCustomCommandsInfo(out respCustomCommandsInfo));
@@ -105,7 +107,7 @@ namespace Garnet.test.Resp.ACL
                 IEnumerable<RespCommand> allValues = Enum.GetValues<RespCommand>().Select(static x => x.NormalizeForACLs()).Distinct();
                 IEnumerable<RespCommand> testableValues =
                     allValues
-                    .Except([RespCommand.NONE, RespCommand.INVALID])
+                    .Except([RespCommand.NONE, RespCommand.INVALID, RespCommand.DELIFEXPIM])
                     .Where(cmd => !withOnlySubCommands.Contains(cmd.ToString().Replace("_", ""), StringComparer.OrdinalIgnoreCase))
                     .Where(cmd => !notCoveredByACLs.Contains(cmd.ToString().Replace("_", ""), StringComparer.OrdinalIgnoreCase));
                 IEnumerable<RespCommand> notCovered = testableValues.Where(cmd => !covered.Contains(cmd.ToString().Replace("_", ""), StringComparer.OrdinalIgnoreCase));
@@ -176,6 +178,21 @@ namespace Garnet.test.Resp.ACL
             {
                 long val = await client.ExecuteForLongResultAsync("ACL", ["DELUSER", "does-not-exist-1", "does-not-exist-2"]);
                 ClassicAssert.AreEqual(0, val);
+            }
+        }
+
+        [Test]
+        public async Task AclGenPassACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ACL GENPASS",
+                [DoAclGenPassAsync]
+            );
+
+            static async Task DoAclGenPassAsync(GarnetClient client)
+            {
+                var result = await client.ExecuteForStringResultAsync("ACL", ["GENPASS"]);
+                ClassicAssert.AreEqual(64, result.Length);
             }
         }
 
@@ -316,6 +333,20 @@ namespace Garnet.test.Resp.ACL
             {
                 string val = await client.ExecuteForStringResultAsync("ACL", ["WHOAMI"]);
                 ClassicAssert.AreNotEqual("", (string)val);
+            }
+        }
+
+        [Test]
+        public async Task ExpDelScanACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "EXPDELSCAN",
+                [DoExpDelScanAsync]
+            );
+
+            static async Task DoExpDelScanAsync(GarnetClient client)
+            {
+                await client.ExecuteForStringResultAsync("EXPDELSCAN");
             }
         }
 
@@ -1448,6 +1479,35 @@ namespace Garnet.test.Resp.ACL
                 try
                 {
                     await client.ExecuteForStringResultAsync("CLUSTER", ["FAILSTOPWRITES", "foo"]);
+                    Assert.Fail("Shouldn't be reachable, cluster isn't enabled");
+                }
+                catch (Exception e)
+                {
+                    if (e.Message == "ERR This instance has cluster support disabled")
+                    {
+                        return;
+                    }
+
+                    throw;
+                }
+            }
+        }
+
+        [Test]
+        public async Task ClusterFlushAllACLsAsync()
+        {
+            // All cluster command "success" is a thrown exception, because clustering is disabled
+
+            await CheckCommandsAsync(
+                "CLUSTER FLUSHALL",
+                [DoClusterFlushAllAsync]
+            );
+
+            static async Task DoClusterFlushAllAsync(GarnetClient client)
+            {
+                try
+                {
+                    await client.ExecuteForStringResultAsync("CLUSTER", ["FLUSHALL"]);
                     Assert.Fail("Shouldn't be reachable, cluster isn't enabled");
                 }
                 catch (Exception e)
@@ -5195,7 +5255,7 @@ namespace Garnet.test.Resp.ACL
                 }
                 catch (Exception e)
                 {
-                    if (e.Message == "ERR malformed REGISTERCS command.")
+                    if (e.Message == "ERR wrong number of arguments for 'REGISTERCS' command")
                     {
                         return;
                     }
@@ -5569,6 +5629,21 @@ namespace Garnet.test.Resp.ACL
             static async Task DoSetIfGreaterAsync(GarnetClient client)
             {
                 var res = await client.ExecuteForStringArrayResultAsync("SETIFGREATER", ["foo", "rizz", "0"]);
+                ClassicAssert.IsNotNull(res);
+            }
+        }
+
+        [Test]
+        public async Task DelIfGreaterACLsAsync()
+        {
+            await CheckCommandsAsync(
+               "DELIFGREATER",
+               [DoDelIfGreaterAsync]
+           );
+
+            static async Task DoDelIfGreaterAsync(GarnetClient client)
+            {
+                var res = await client.ExecuteForStringArrayResultAsync("DELIFGREATER", ["foo", "1"]);
                 ClassicAssert.IsNotNull(res);
             }
         }
@@ -6286,6 +6361,66 @@ namespace Garnet.test.Resp.ACL
         }
 
         [Test]
+        public async Task GeoRadiusACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "GEORADIUS",
+                [DoGeoRadiusAsync],
+                skipPermitted: true
+            );
+
+            static async Task DoGeoRadiusAsync(GarnetClient client)
+            {
+                await client.ExecuteForStringResultAsync("GEORADIUS", ["foo", "0", "85", "10", "km"]);
+            }
+        }
+
+        [Test]
+        public async Task GeoRadiusROACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "GEORADIUS_RO",
+                [DoGeoRadiusROAsync],
+                skipPermitted: true
+            );
+
+            static async Task DoGeoRadiusROAsync(GarnetClient client)
+            {
+                await client.ExecuteForStringResultAsync("GEORADIUS_RO", ["foo", "0", "85", "10", "km"]);
+            }
+        }
+
+        [Test]
+        public async Task GeoRadiusByMemberACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "GEORADIUSBYMEMBER",
+                [DoGeoRadiusByMemberAsync],
+                skipPermitted: true
+            );
+
+            static async Task DoGeoRadiusByMemberAsync(GarnetClient client)
+            {
+                await client.ExecuteForStringResultAsync("GEORADIUSBYMEMBER", ["foo", "bar", "10", "km"]);
+            }
+        }
+
+        [Test]
+        public async Task GeoRadiusByMemberROACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "GEORADIUSBYMEMBER_RO",
+                [DoGeoRadiusByMemberROAsync],
+                skipPermitted: true
+            );
+
+            static async Task DoGeoRadiusByMemberROAsync(GarnetClient client)
+            {
+                await client.ExecuteForStringResultAsync("GEORADIUSBYMEMBER_RO", ["foo", "bar", "10", "km"]);
+            }
+        }
+
+        [Test]
         public async Task GeoSearchACLsAsync()
         {
             await CheckCommandsAsync(
@@ -6963,6 +7098,165 @@ namespace Garnet.test.Resp.ACL
         }
 
         [Test]
+        public async Task ZExpireACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZEXPIRE",
+                [DoZExpireAsync]
+            );
+
+            static async Task DoZExpireAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZEXPIRE", ["foo", "1", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZPExpireACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZPEXPIRE",
+                [DoZPExpireAsync]
+            );
+
+            static async Task DoZPExpireAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZPEXPIRE", ["foo", "1", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZExpireAtACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZEXPIREAT",
+                [DoZExpireAtAsync]
+            );
+
+            static async Task DoZExpireAtAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZEXPIREAT", ["foo", DateTimeOffset.UtcNow.AddSeconds(3).ToUnixTimeSeconds().ToString(), "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZPExpireAtACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZPEXPIREAT",
+                [DoZPExpireAtAsync]
+            );
+
+            static async Task DoZPExpireAtAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZPEXPIREAT", ["foo", DateTimeOffset.UtcNow.AddSeconds(3).ToUnixTimeMilliseconds().ToString(), "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZExpireTimeACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZEXPIRETIME",
+                [DoZExpireTimeAsync]
+            );
+
+            static async Task DoZExpireTimeAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZEXPIRETIME", ["foo", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZPExpireTimeACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZPEXPIRETIME",
+                [DoZPExpireTimeAsync]
+            );
+
+            static async Task DoZPExpireTimeAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZPEXPIRETIME", ["foo", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZTTLACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZTTL",
+                [DoZETTLAsync]
+            );
+
+            static async Task DoZETTLAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZTTL", ["foo", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZPTTLACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZPTTL",
+                [DoZPETTLAsync]
+            );
+
+            static async Task DoZPETTLAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZPTTL", ["foo", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZPersistACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZPERSIST",
+                [DoZPersistAsync]
+            );
+
+            static async Task DoZPersistAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringArrayResultAsync("ZPERSIST", ["foo", "MEMBERS", "1", "bar"]);
+                ClassicAssert.AreEqual(1, val.Length);
+                ClassicAssert.AreEqual("-2", val[0]);
+            }
+        }
+
+        [Test]
+        public async Task ZCollectACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "ZCOLLECT",
+                [DoZCollectAsync]
+            );
+
+            static async Task DoZCollectAsync(GarnetClient client)
+            {
+                var val = await client.ExecuteForStringResultAsync("ZCOLLECT", ["foo"]);
+                ClassicAssert.AreEqual("OK", val);
+            }
+        }
+
+        [Test]
         public async Task TimeACLsAsync()
         {
             await CheckCommandsAsync(
@@ -7041,6 +7335,32 @@ namespace Garnet.test.Resp.ACL
                     ]);
 
                 ClassicAssert.AreEqual("OK", val);
+            }
+        }
+
+        [Test]
+        public async Task SwapDbACLsAsync()
+        {
+            await CheckCommandsAsync(
+                "SWAPDB",
+                [DoSwapDbAsync]
+            );
+
+            static async Task DoSwapDbAsync(GarnetClient client)
+            {
+                try
+                {
+                    // Currently SWAPDB does not support calling the command when multiple clients are connected to the server.
+                    await client.ExecuteForStringResultAsync("SWAPDB", ["0", "1"]);
+                    Assert.Fail("Shouldn't reach here, calling SWAPDB should fail.");
+                }
+                catch (Exception ex)
+                {
+                    if (ex.Message == Encoding.ASCII.GetString(CmdStrings.RESP_ERR_NOAUTH))
+                        throw;
+
+                    ClassicAssert.AreEqual(Encoding.ASCII.GetString(CmdStrings.RESP_ERR_SWAPDB_UNSUPPORTED), ex.Message);
+                }
             }
         }
 

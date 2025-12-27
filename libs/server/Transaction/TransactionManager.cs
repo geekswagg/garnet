@@ -65,9 +65,10 @@ namespace Garnet.server
 
         private readonly RespServerSession respSession;
         readonly FunctionsState functionsState;
-        internal readonly ScratchBufferManager scratchBufferManager;
+        internal readonly ScratchBufferAllocator scratchBufferAllocator;
         private readonly TsavoriteLog appendOnlyFile;
         internal readonly WatchedKeysContainer watchContainer;
+        private readonly StateMachineDriver stateMachineDriver;
         internal int txnStartHead;
         internal int operationCntTxn;
 
@@ -79,6 +80,7 @@ namespace Garnet.server
         private const int initialKeyBufferSize = 1 << 10;
         StoreType transactionStoreType;
         readonly ILogger logger;
+        long txnVersion;
 
         internal LockableContext<SpanByte, SpanByte, RawStringInput, SpanByteAndMemory, long, MainSessionFunctions, MainStoreFunctions, MainStoreAllocator> LockableContext
             => lockableContext;
@@ -92,12 +94,15 @@ namespace Garnet.server
         /// </summary>
         private TxnKeyEntries keyEntries;
 
-        internal TransactionManager(
+        internal TransactionManager(StoreWrapper storeWrapper,
             RespServerSession respSession,
+            BasicGarnetApi garnetApi,
+            LockableGarnetApi lockableGarnetApi,
             StorageSession storageSession,
-            ScratchBufferManager scratchBufferManager,
+            ScratchBufferAllocator scratchBufferAllocator,
             bool clusterEnabled,
-            ILogger logger = null)
+            ILogger logger = null,
+            int dbId = 0)
         {
             var session = storageSession.basicContext.Session;
             basicContext = session.BasicContext;
@@ -118,11 +123,15 @@ namespace Garnet.server
 
             watchContainer = new WatchedKeysContainer(initialSliceBufferSize, functionsState.watchVersionMap);
             keyEntries = new TxnKeyEntries(initialSliceBufferSize, lockableContext, objectStoreLockableContext);
-            this.scratchBufferManager = scratchBufferManager;
+            this.scratchBufferAllocator = scratchBufferAllocator;
 
-            garnetTxMainApi = respSession.lockableGarnetApi;
-            garnetTxPrepareApi = new GarnetWatchApi<BasicGarnetApi>(respSession.basicGarnetApi);
-            garnetTxFinalizeApi = respSession.basicGarnetApi;
+            var dbFound = storeWrapper.TryGetDatabase(dbId, out var db);
+            Debug.Assert(dbFound);
+            this.stateMachineDriver = db.StateMachineDriver;
+
+            garnetTxMainApi = lockableGarnetApi;
+            garnetTxPrepareApi = new GarnetWatchApi<BasicGarnetApi>(garnetApi);
+            garnetTxFinalizeApi = garnetApi;
 
             this.clusterEnabled = clusterEnabled;
             if (clusterEnabled)
@@ -135,18 +144,26 @@ namespace Garnet.server
         {
             if (isRunning)
             {
-                keyEntries.UnlockAllKeys();
-
-                // Release context
-                if (transactionStoreType == StoreType.Main || transactionStoreType == StoreType.All)
-                    lockableContext.EndLockable();
-                if (transactionStoreType == StoreType.Object || transactionStoreType == StoreType.All)
+                try
                 {
-                    if (objectStoreBasicContext.IsNull)
-                        throw new Exception("Trying to perform object store transaction with object store disabled");
-                    objectStoreLockableContext.EndLockable();
+                    keyEntries.UnlockAllKeys();
+
+                    // Release context
+                    if (transactionStoreType == StoreType.Main || transactionStoreType == StoreType.All)
+                        lockableContext.EndLockable();
+                    if (transactionStoreType == StoreType.Object || transactionStoreType == StoreType.All)
+                    {
+                        if (objectStoreBasicContext.IsNull)
+                            throw new Exception("Trying to perform object store transaction with object store disabled");
+                        objectStoreLockableContext.EndLockable();
+                    }
+                }
+                finally
+                {
+                    stateMachineDriver.EndTransaction(txnVersion);
                 }
             }
+            this.txnVersion = 0;
             this.txnStartHead = 0;
             this.operationCntTxn = 0;
             this.state = TxnState.None;
@@ -158,10 +175,10 @@ namespace Garnet.server
             this.keyCount = 0;
         }
 
-        internal bool RunTransactionProc(byte id, ref CustomProcedureInput procInput, CustomTransactionProcedure proc, ref MemoryResult<byte> output)
+        internal bool RunTransactionProc(byte id, ref CustomProcedureInput procInput, CustomTransactionProcedure proc, ref MemoryResult<byte> output, bool isRecovering = false)
         {
             var running = false;
-            scratchBufferManager.Reset();
+            scratchBufferAllocator.Reset();
             try
             {
                 // If cluster is enabled reset slot verification state cache
@@ -210,13 +227,19 @@ namespace Garnet.server
             {
                 try
                 {
-                    // Run finalize procedure at the end
-                    proc.Finalize(garnetTxFinalizeApi, ref procInput, ref output);
+                    // Run finalize procedure at the end.
+                    // If the transaction was invoked during AOF replay skip the finalize step altogether
+                    // Finalize logs to AOF accordingly, so let the replay pick up the commits from AOF as
+                    // part of normal AOF replay.
+                    if (!isRecovering)
+                    {
+                        proc.Finalize(garnetTxFinalizeApi, ref procInput, ref output);
+                    }
                 }
                 catch { }
 
                 // Reset scratch buffer for next txn invocation
-                scratchBufferManager.Reset();
+                scratchBufferAllocator.Reset();
             }
 
 
@@ -238,14 +261,17 @@ namespace Garnet.server
         {
             Debug.Assert(functionsState.StoredProcMode);
 
-            appendOnlyFile?.Enqueue(new AofHeader { opType = AofEntryType.StoredProcedure, procedureId = id, storeVersion = basicContext.Session.Version, sessionID = basicContext.Session.ID }, ref procInput, out _);
+            appendOnlyFile?.Enqueue(
+                new AofHeader { opType = AofEntryType.StoredProcedure, procedureId = id, storeVersion = txnVersion, sessionID = basicContext.Session.ID },
+                ref procInput,
+                out _);
         }
 
         internal void Commit(bool internal_txn = false)
         {
             if (appendOnlyFile != null && !functionsState.StoredProcMode)
             {
-                appendOnlyFile.Enqueue(new AofHeader { opType = AofEntryType.TxnCommit, storeVersion = basicContext.Session.Version, sessionID = basicContext.Session.ID }, out _);
+                appendOnlyFile.Enqueue(new AofHeader { opType = AofEntryType.TxnCommit, storeVersion = txnVersion, sessionID = basicContext.Session.ID }, out _);
             }
             if (!internal_txn)
                 watchContainer.Reset();
@@ -292,23 +318,45 @@ namespace Garnet.server
             readOnly = keyEntries.IsReadOnly;
         }
 
+        void BeginLockable(StoreType transactionStoreType)
+        {
+            if (transactionStoreType is StoreType.All or StoreType.Main)
+            {
+                lockableContext.BeginLockable();
+            }
+            if (transactionStoreType is StoreType.All or StoreType.Object)
+            {
+                if (objectStoreBasicContext.IsNull)
+                    throw new Exception("Trying to perform object store transaction with object store disabled");
+                objectStoreLockableContext.BeginLockable();
+            }
+        }
+
+        void LocksAcquired(StoreType transactionStoreType, long txnVersion)
+        {
+            if (transactionStoreType is StoreType.All or StoreType.Main)
+            {
+                lockableContext.LocksAcquired(txnVersion);
+            }
+            if (transactionStoreType is StoreType.All or StoreType.Object)
+            {
+                if (objectStoreBasicContext.IsNull)
+                    throw new Exception("Trying to perform object store transaction with object store disabled");
+                objectStoreLockableContext.LocksAcquired(txnVersion);
+            }
+        }
+
         internal bool Run(bool internal_txn = false, bool fail_fast_on_lock = false, TimeSpan lock_timeout = default)
         {
             // Save watch keys to lock list
             if (!internal_txn)
                 watchContainer.SaveKeysToLock(this);
 
+            // Acquire transaction version
+            txnVersion = stateMachineDriver.AcquireTransactionVersion();
+
             // Acquire lock sessions
-            if (transactionStoreType == StoreType.All || transactionStoreType == StoreType.Main)
-            {
-                lockableContext.BeginLockable();
-            }
-            if (transactionStoreType == StoreType.All || transactionStoreType == StoreType.Object)
-            {
-                if (objectStoreBasicContext.IsNull)
-                    throw new Exception("Trying to perform object store transaction with object store disabled");
-                objectStoreLockableContext.BeginLockable();
-            }
+            BeginLockable(transactionStoreType);
 
             bool lockSuccess;
             if (fail_fast_on_lock)
@@ -334,9 +382,15 @@ namespace Garnet.server
                 return false;
             }
 
+            // Verify transaction version
+            txnVersion = stateMachineDriver.VerifyTransactionVersion(txnVersion);
+
+            // Update sessions with transaction version
+            LocksAcquired(transactionStoreType, txnVersion);
+
             if (appendOnlyFile != null && !functionsState.StoredProcMode)
             {
-                appendOnlyFile.Enqueue(new AofHeader { opType = AofEntryType.TxnStart, storeVersion = basicContext.Session.Version, sessionID = basicContext.Session.ID }, out _);
+                appendOnlyFile.Enqueue(new AofHeader { opType = AofEntryType.TxnStart, storeVersion = txnVersion, sessionID = basicContext.Session.ID }, out _);
             }
 
             state = TxnState.Running;

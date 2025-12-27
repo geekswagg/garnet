@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -12,6 +13,7 @@ using Garnet.common.Parsing;
 using Garnet.networking;
 using Garnet.server.ACL;
 using Garnet.server.Auth;
+using Garnet.server.Auth.Settings;
 using HdrHistogram;
 using Microsoft.Extensions.Logging;
 using Tsavorite.core;
@@ -37,9 +39,8 @@ namespace Garnet.server
     internal sealed unsafe partial class RespServerSession : ServerSessionBase
     {
         readonly GarnetSessionMetrics sessionMetrics;
-        readonly GarnetLatencyMetricsSession LatencyMetrics;
 
-        public GarnetLatencyMetricsSession latencyMetrics => LatencyMetrics;
+        public GarnetLatencyMetricsSession LatencyMetrics { get; }
 
         /// <summary>
         /// Get a copy of sessionMetrics
@@ -54,16 +55,16 @@ namespace Garnet.server
         /// <summary>
         /// Reset latencyMetrics for eventType
         /// </summary>
-        public void ResetLatencyMetrics(LatencyMetricsType latencyEvent) => latencyMetrics?.Reset(latencyEvent);
+        public void ResetLatencyMetrics(LatencyMetricsType latencyEvent) => LatencyMetrics?.Reset(latencyEvent);
 
         /// <summary>
         /// Reset all latencyMetrics
         /// </summary>
-        public void ResetAllLatencyMetrics() => latencyMetrics?.ResetAll();
+        public void ResetAllLatencyMetrics() => LatencyMetrics?.ResetAll();
 
         readonly StoreWrapper storeWrapper;
-        internal readonly TransactionManager txnManager;
-        internal readonly ScratchBufferManager scratchBufferManager;
+        internal readonly ScratchBufferBuilder scratchBufferBuilder;
+        internal readonly ScratchBufferAllocator scratchBufferAllocator;
 
         internal SessionParseState parseState;
         internal SessionParseState customCommandParseState;
@@ -77,7 +78,7 @@ namespace Garnet.server
         byte* recvBufferPtr;
 
         /// <summary>
-        /// Current readHead. On successful parsing, this is left at the start of 
+        /// Current readHead. On successful parsing, this is left at the start of
         /// the command payload for use by legacy operators.
         /// </summary>
         int readHead;
@@ -91,11 +92,25 @@ namespace Garnet.server
         bool toDispose;
 
         int opCount;
-        public readonly StorageSession storageSession;
+
+        /// <summary>
+        /// Current database session items
+        /// </summary>
+        public StorageSession storageSession;
         internal BasicGarnetApi basicGarnetApi;
         internal LockableGarnetApi lockableGarnetApi;
+        internal TransactionManager txnManager;
 
         readonly IGarnetAuthenticator _authenticator;
+
+        // Current active database ID
+        internal int activeDbId;
+
+        // True if multiple logical databases are enabled on this session
+        readonly bool allowMultiDb;
+
+        // Map of all active database sessions (default of size 1, containing DB 0 session)
+        private ExpandableMap<GarnetDatabaseSession> databaseSessions;
 
         /// <summary>
         /// The user currently authenticated in this session
@@ -104,6 +119,8 @@ namespace Garnet.server
 
         readonly ILogger logger = null;
 
+        IGarnetServer server;
+
         /// <summary>
         /// Clients must enable asking to make node respond to requests on slots that are being imported.
         /// </summary>
@@ -111,10 +128,22 @@ namespace Garnet.server
 
         /// <summary>
         /// If set, commands can use this to enumerate details about the server or other sessions.
-        /// 
+        ///
         /// It is not guaranteed to be set.
         /// </summary>
-        public IGarnetServer Server { get; set; }
+        public IGarnetServer Server
+        {
+            get => server;
+            set
+            {
+                server = value;
+                if (clusterSession is not null)
+                {
+                    clusterSession.Server = value;
+                }
+            }
+        }
+
 
         // Track whether the incoming network batch contains slow commands that should not be counter in NET_RS histogram
         bool containsSlowCommand;
@@ -149,7 +178,7 @@ namespace Garnet.server
         /// <summary>
         /// RESP protocol version (RESP2 is the default)
         /// </summary>
-        internal byte respProtocolVersion = 2;
+        public byte respProtocolVersion { get; private set; } = ServerOptions.DEFAULT_RESP_VERSION;
 
         /// <summary>
         /// Client name for the session
@@ -160,6 +189,7 @@ namespace Garnet.server
         /// Name of the client library.
         /// </summary>
         string clientLibName = null;
+
         /// <summary>
         /// Version of the client library.
         /// </summary>
@@ -191,13 +221,25 @@ namespace Garnet.server
         // Threshold for slow log in ticks (0 means disabled)
         readonly long slowLogThreshold;
 
+        /// <summary>
+        /// Create a new RESP server session
+        /// </summary>
+        /// <param name="id"></param>
+        /// <param name="networkSender"></param>
+        /// <param name="storeWrapper"></param>
+        /// <param name="subscribeBroker"></param>
+        /// <param name="authenticator"></param>
+        /// <param name="enableScripts"></param>
+        /// <param name="clusterProvider"></param>
+        /// <exception cref="GarnetException"></exception>
         public RespServerSession(
             long id,
             INetworkSender networkSender,
             StoreWrapper storeWrapper,
             SubscribeBroker subscribeBroker,
             IGarnetAuthenticator authenticator,
-            bool enableScripts)
+            bool enableScripts,
+            IClusterProvider clusterProvider = null)
             : base(networkSender)
         {
             this.customCommandManagerSession = new CustomCommandManagerSession(storeWrapper.customCommandManager);
@@ -211,13 +253,10 @@ namespace Garnet.server
             logger?.LogDebug("Starting RespServerSession Id={0}", this.Id);
 
             // Initialize session-local scratch buffer of size 64 bytes, used for constructing arguments in GarnetApi
-            this.scratchBufferManager = new ScratchBufferManager();
+            this.scratchBufferBuilder = new ScratchBufferBuilder();
 
-            // Create storage session and API
-            this.storageSession = new StorageSession(storeWrapper, scratchBufferManager, sessionMetrics, LatencyMetrics, logger);
-
-            this.basicGarnetApi = new BasicGarnetApi(storageSession, storageSession.basicContext, storageSession.objectStoreBasicContext);
-            this.lockableGarnetApi = new LockableGarnetApi(storageSession, storageSession.lockableContext, storageSession.objectStoreLockableContext);
+            // Initialize session-local scratch allocation of size 64 bytes, used for constructing arguments in GarnetApi
+            this.scratchBufferAllocator = new ScratchBufferAllocator();
 
             this.storeWrapper = storeWrapper;
             this.subscribeBroker = subscribeBroker;
@@ -226,13 +265,25 @@ namespace Garnet.server
             if (storeWrapper.serverOptions.EnableLua && enableScripts)
                 sessionScriptCache = new(storeWrapper, _authenticator, storeWrapper.luaTimeoutManager, logger);
 
+            allowMultiDb = storeWrapper.serverOptions.AllowMultiDb;
+
+            // Create the default DB session (for DB 0) & add it to the session map
+            activeDbId = 0;
+            var dbSession = CreateDatabaseSession(0);
+            var maxDbs = storeWrapper.serverOptions.MaxDatabases;
+
+            databaseSessions = new ExpandableMap<GarnetDatabaseSession>(1, 0, maxDbs - 1);
+            if (!databaseSessions.TrySetValue(0, dbSession))
+                throw new GarnetException("Failed to set initial database session in database sessions map");
+
+            // Set the current active session to the default session
+            SwitchActiveDatabaseSession(dbSession);
+
             // Associate new session with default user and automatically authenticate, if possible
             this.AuthenticateUser(Encoding.ASCII.GetBytes(this.storeWrapper.accessControlList.GetDefaultUserHandle().User.Name));
 
-            txnManager = new TransactionManager(this, storageSession, scratchBufferManager, storeWrapper.serverOptions.EnableCluster, logger);
-            storageSession.txnManager = txnManager;
-
-            clusterSession = storeWrapper.clusterProvider?.CreateClusterSession(txnManager, this._authenticator, this._userHandle, sessionMetrics, basicGarnetApi, networkSender, logger);
+            var cp = clusterProvider ?? storeWrapper.clusterProvider;
+            clusterSession = cp?.CreateClusterSession(txnManager, this._authenticator, this._userHandle, sessionMetrics, basicGarnetApi, networkSender, logger);
             clusterSession?.SetUserHandle(this._userHandle);
             sessionScriptCache?.SetUserHandle(this._userHandle);
 
@@ -251,10 +302,62 @@ namespace Garnet.server
             }
         }
 
+        /// <summary>
+        /// Just for fuzzing and testing purposes, do not use otherwise.
+        /// </summary>
+        internal RespServerSession() : base(null)
+        {
+            var cmdManager = new CustomCommandManager();
+            customCommandManagerSession = new(cmdManager);
+            storeWrapper = new(
+                "",
+                "",
+                [],
+                cmdManager,
+                new(),
+                subscribeBroker: null,
+                createDatabaseDelegate: delegate { return new(); }
+            );
+        }
+
+        /// <summary>
+        /// Get all active database sessions
+        /// </summary>
+        /// <returns>Array of active database sessions</returns>
+        public GarnetDatabaseSession[] GetDatabaseSessionsSnapshot()
+        {
+            var databaseSessionsMapSize = databaseSessions.ActualSize;
+            var databaseSessionsMapSnapshot = databaseSessions.Map;
+
+            // If there is only 1 active session, it is the default session
+            if (databaseSessionsMapSize == 1)
+                return [databaseSessionsMapSnapshot[0]];
+
+            var databaseSessionsSnapshot = new List<GarnetDatabaseSession>();
+
+            for (var i = 0; i < databaseSessionsMapSize; i++)
+            {
+                if (databaseSessionsMapSnapshot[i] != null)
+                    databaseSessionsSnapshot.Add(databaseSessionsMapSnapshot[i]);
+            }
+
+            return databaseSessionsSnapshot.ToArray();
+        }
+
         internal void SetUserHandle(UserHandle userHandle)
         {
             this._userHandle = userHandle;
             clusterSession?.SetUserHandle(userHandle);
+        }
+
+        /// <summary>
+        /// Update RESP protocol version used by session
+        /// </summary>
+        /// <param name="_respProtocolVersion"></param>
+        public void UpdateRespProtocolVersion(byte _respProtocolVersion)
+        {
+            this.respProtocolVersion = _respProtocolVersion;
+            this.storageSession.UpdateRespProtocolVersion(respProtocolVersion);
         }
 
         public override void Dispose()
@@ -266,8 +369,12 @@ namespace Garnet.server
                 try { if (recvHandle.IsAllocated) recvHandle.Free(); } catch { }
             }
 
+            // Dispose all database sessions
+            foreach (var dbSession in databaseSessions.Map)
+                dbSession?.Dispose();
+
             if (storeWrapper.serverOptions.MetricsSamplingFrequency > 0 || storeWrapper.serverOptions.LatencyMonitor)
-                storeWrapper.monitor.AddMetricsHistorySessionDispose(sessionMetrics, latencyMetrics);
+                storeWrapper.monitor.AddMetricsHistorySessionDispose(sessionMetrics, LatencyMetrics);
 
             subscribeBroker?.RemoveSubscription(this);
             storeWrapper.itemBroker?.HandleSessionDisposed(this);
@@ -276,8 +383,6 @@ namespace Garnet.server
             // Cancel the async processor, if any
             asyncWaiterCancel?.Cancel();
             asyncWaiter?.Signal();
-
-            storageSession.Dispose();
         }
 
         public int StoreSessionID => storageSession.SessionID;
@@ -315,6 +420,26 @@ namespace Garnet.server
             return _authenticator.CanAuthenticate ? success : false;
         }
 
+        internal bool CanRunDebug()
+        {
+            var enableDebugCommand = storeWrapper.serverOptions.EnableDebugCommand;
+
+            return
+                (enableDebugCommand == ConnectionProtectionOption.Yes) ||
+                ((enableDebugCommand == ConnectionProtectionOption.Local) &&
+                    networkSender.IsLocalConnection());
+        }
+
+        internal bool CanRunModule()
+        {
+            var enableModuleCommand = storeWrapper.serverOptions.EnableModuleCommand;
+
+            return
+                (enableModuleCommand == ConnectionProtectionOption.Yes) ||
+                ((enableModuleCommand == ConnectionProtectionOption.Local) &&
+                    networkSender.IsLocalConnection());
+        }
+
         public override int TryConsumeMessages(byte* reqBuffer, int bytesReceived)
         {
             bytesRead = bytesReceived;
@@ -322,10 +447,10 @@ namespace Garnet.server
                 readHead = 0;
             try
             {
-                latencyMetrics?.Start(LatencyMetricsType.NET_RS_LAT);
+                LatencyMetrics?.Start(LatencyMetricsType.NET_RS_LAT);
                 if (slowLogThreshold > 0)
                 {
-                    slowLogStartTime = latencyMetrics != null ? latencyMetrics.Get(LatencyMetricsType.NET_RS_LAT) : Stopwatch.GetTimestamp();
+                    slowLogStartTime = LatencyMetrics != null ? LatencyMetrics.Get(LatencyMetricsType.NET_RS_LAT) : Stopwatch.GetTimestamp();
                 }
                 clusterSession?.AcquireCurrentEpoch();
                 recvBufferPtr = reqBuffer;
@@ -388,7 +513,8 @@ namespace Garnet.server
             {
                 networkSender.ExitAndReturnResponseObject();
                 clusterSession?.ReleaseCurrentEpoch();
-                scratchBufferManager.Reset();
+                scratchBufferBuilder.Reset();
+                scratchBufferAllocator.Reset();
             }
 
             if (txnManager.IsSkippingOperations())
@@ -397,17 +523,17 @@ namespace Garnet.server
             // If server processed input data successfully, update tracked metrics
             if (readHead > 0)
             {
-                if (latencyMetrics != null)
+                if (LatencyMetrics != null)
                 {
                     if (containsSlowCommand)
                     {
-                        latencyMetrics.StopAndSwitch(LatencyMetricsType.NET_RS_LAT, LatencyMetricsType.NET_RS_LAT_ADMIN);
+                        LatencyMetrics.StopAndSwitch(LatencyMetricsType.NET_RS_LAT, LatencyMetricsType.NET_RS_LAT_ADMIN);
                         containsSlowCommand = false;
                     }
                     else
-                        latencyMetrics.Stop(LatencyMetricsType.NET_RS_LAT);
-                    latencyMetrics.RecordValue(LatencyMetricsType.NET_RS_BYTES, readHead);
-                    latencyMetrics.RecordValue(LatencyMetricsType.NET_RS_OPS, opCount);
+                        LatencyMetrics.Stop(LatencyMetricsType.NET_RS_LAT);
+                    LatencyMetrics.RecordValue(LatencyMetricsType.NET_RS_BYTES, readHead);
+                    LatencyMetrics.RecordValue(LatencyMetricsType.NET_RS_OPS, opCount);
                     opCount = 0;
                 }
                 sessionMetrics?.incr_total_net_input_bytes((ulong)readHead);
@@ -507,7 +633,7 @@ namespace Garnet.server
                 _origReadHead = readHead = endReadHead;
 
                 // Handle metrics and special cases
-                if (latencyMetrics != null) opCount++;
+                if (LatencyMetrics != null) opCount++;
                 if (slowLogThreshold > 0) HandleSlowLog(cmd);
                 if (sessionMetrics != null)
                 {
@@ -531,7 +657,7 @@ namespace Garnet.server
         }
 
         // Make first command in string as uppercase
-        private bool MakeUpperCase(byte* ptr)
+        private bool MakeUpperCase(byte* ptr, int len)
         {
             // Assume most commands are already upper case.
             // Assume most commands are 2-8 bytes long.
@@ -542,18 +668,17 @@ namespace Garnet.server
             //  *.\r\n$8\r\n........\r\n  = 18 bytes
             //
             // Where . is <= 95
-            // 
+            //
             // Note that _all_ of these bytes are <= 95 in the common case
             // and there's no need to scan the whole string in those cases.
 
-            var len = bytesRead - readHead;
             if (len >= 12)
             {
                 var cmdLen = (uint)(*(ptr + 5) - '2');
                 if (cmdLen <= 6 && (ptr + 4 + cmdLen + sizeof(ulong)) <= (ptr + len))
                 {
                     var firstUlong = *(ulong*)(ptr + 4);
-                    var secondUlong = *((ulong*)ptr + 4 + cmdLen);
+                    var secondUlong = *(ulong*)(ptr + 4 + cmdLen);
 
                     // Ye olde bit twiddling to check if any sub-byte is > 95
                     // See: https://graphics.stanford.edu/~seander/bithacks.html#HasMoreInWord
@@ -578,7 +703,7 @@ namespace Garnet.server
                 if (*tmp > 64) // found string
                 {
                     var ret = false;
-                    while (*tmp > 64 && *tmp < 123 && tmp < (ptr + len))
+                    while (*tmp > 32 && *tmp < 123 && tmp < (ptr + len))
                     {
                         if (*tmp > 96) { ret = true; *tmp -= 32; }
                         tmp++;
@@ -646,8 +771,8 @@ namespace Garnet.server
                 RespCommand.RUNTXP => NetworkRUNTXP(),
                 RespCommand.READONLY => NetworkREADONLY(),
                 RespCommand.READWRITE => NetworkREADWRITE(),
-                RespCommand.EXPIREAT => NetworkEXPIREAT(RespCommand.EXPIREAT, ref storageApi),
-                RespCommand.PEXPIREAT => NetworkEXPIREAT(RespCommand.PEXPIREAT, ref storageApi),
+                RespCommand.EXPIREAT => NetworkEXPIRE(RespCommand.EXPIREAT, ref storageApi),
+                RespCommand.PEXPIREAT => NetworkEXPIRE(RespCommand.PEXPIREAT, ref storageApi),
                 RespCommand.DUMP => NetworkDUMP(ref storageApi),
                 RespCommand.RESTORE => NetworkRESTORE(ref storageApi),
 
@@ -671,6 +796,7 @@ namespace Garnet.server
                 RespCommand.MSETNX => NetworkMSETNX(ref storageApi),
                 RespCommand.UNLINK => NetworkDEL(ref storageApi),
                 RespCommand.SELECT => NetworkSELECT(),
+                RespCommand.SWAPDB => NetworkSWAPDB(),
                 RespCommand.WATCH => NetworkWATCH(),
                 RespCommand.WATCHMS => NetworkWATCH_MS(),
                 RespCommand.WATCHOS => NetworkWATCH_OS(),
@@ -721,13 +847,26 @@ namespace Garnet.server
                 RespCommand.ZINTERSTORE => SortedSetIntersectStore(ref storageApi),
                 RespCommand.ZUNION => SortedSetUnion(ref storageApi),
                 RespCommand.ZUNIONSTORE => SortedSetUnionStore(ref storageApi),
+                RespCommand.ZEXPIRE => SortedSetExpire(cmd, ref storageApi),
+                RespCommand.ZPEXPIRE => SortedSetExpire(cmd, ref storageApi),
+                RespCommand.ZEXPIREAT => SortedSetExpire(cmd, ref storageApi),
+                RespCommand.ZPEXPIREAT => SortedSetExpire(cmd, ref storageApi),
+                RespCommand.ZTTL => SortedSetTimeToLive(cmd, ref storageApi),
+                RespCommand.ZPTTL => SortedSetTimeToLive(cmd, ref storageApi),
+                RespCommand.ZEXPIRETIME => SortedSetTimeToLive(cmd, ref storageApi),
+                RespCommand.ZPEXPIRETIME => SortedSetTimeToLive(cmd, ref storageApi),
+                RespCommand.ZPERSIST => SortedSetPersist(ref storageApi),
                 //SortedSet for Geo Commands
                 RespCommand.GEOADD => GeoAdd(ref storageApi),
                 RespCommand.GEOHASH => GeoCommands(cmd, ref storageApi),
                 RespCommand.GEODIST => GeoCommands(cmd, ref storageApi),
                 RespCommand.GEOPOS => GeoCommands(cmd, ref storageApi),
-                RespCommand.GEOSEARCH => GeoCommands(cmd, ref storageApi),
-                RespCommand.GEOSEARCHSTORE => GeoSearchStore(ref storageApi),
+                RespCommand.GEORADIUS => GeoSearchCommands(cmd, ref storageApi),
+                RespCommand.GEORADIUS_RO => GeoSearchCommands(cmd, ref storageApi),
+                RespCommand.GEORADIUSBYMEMBER => GeoSearchCommands(cmd, ref storageApi),
+                RespCommand.GEORADIUSBYMEMBER_RO => GeoSearchCommands(cmd, ref storageApi),
+                RespCommand.GEOSEARCH => GeoSearchCommands(cmd, ref storageApi),
+                RespCommand.GEOSEARCHSTORE => GeoSearchCommands(cmd, ref storageApi),
                 //HLL Commands
                 RespCommand.PFADD => HyperLogLogAdd(ref storageApi),
                 RespCommand.PFMERGE => HyperLogLogMerge(ref storageApi),
@@ -737,6 +876,7 @@ namespace Garnet.server
                 RespCommand.BITOP_OR => NetworkStringBitOperation(BitmapOperation.OR, ref storageApi),
                 RespCommand.BITOP_XOR => NetworkStringBitOperation(BitmapOperation.XOR, ref storageApi),
                 RespCommand.BITOP_NOT => NetworkStringBitOperation(BitmapOperation.NOT, ref storageApi),
+                RespCommand.BITOP_DIFF => NetworkStringBitOperation(BitmapOperation.DIFF, ref storageApi),
                 RespCommand.BITFIELD => StringBitField(ref storageApi),
                 RespCommand.BITFIELD_RO => StringBitFieldReadOnly(ref storageApi),
                 // List Commands
@@ -870,6 +1010,7 @@ namespace Garnet.server
                 RespCommand.GETIFNOTMATCH => NetworkGETIFNOTMATCH(ref storageApi),
                 RespCommand.SETIFMATCH => NetworkSETIFMATCH(ref storageApi),
                 RespCommand.SETIFGREATER => NetworkSETIFGREATER(ref storageApi),
+                RespCommand.DELIFGREATER => NetworkDELIFGREATER(ref storageApi),
 
                 _ => Process(command, ref storageApi)
             };
@@ -899,7 +1040,7 @@ namespace Garnet.server
                 TryTransactionProc(currentCustomTransaction.id,
                     customCommandManagerSession
                         .GetCustomTransactionProcedure(currentCustomTransaction.id, this, txnManager,
-                            scratchBufferManager, out _));
+                            scratchBufferAllocator, out _));
                 currentCustomTransaction = null;
                 return true;
             }
@@ -978,7 +1119,41 @@ namespace Garnet.server
             return true;
         }
 
-        Span<byte> GetCommand(out bool success)
+        ReadOnlySpan<byte> GetCommand(out bool success)
+        {
+            var ptr = recvBufferPtr + readHead;
+            var end = recvBufferPtr + bytesRead;
+
+            // Try the command length
+            if (!RespReadUtils.TryReadUnsignedLengthHeader(out int length, ref ptr, end))
+            {
+                success = false;
+                return default;
+            }
+
+            readHead = (int)(ptr - recvBufferPtr);
+
+            // Try to read the command value
+            ptr += length;
+            if (ptr + 2 > end)
+            {
+                success = false;
+                return default;
+            }
+
+            if (*(ushort*)ptr != MemoryMarshal.Read<ushort>("\r\n"u8))
+            {
+                RespParsingException.ThrowUnexpectedToken(*ptr);
+            }
+
+            var result = new ReadOnlySpan<byte>(recvBufferPtr + readHead, length);
+            readHead += length + 2;
+            success = true;
+
+            return result;
+        }
+
+        ReadOnlySpan<byte> GetUpperCaseCommand(out bool success)
         {
             var ptr = recvBufferPtr + readHead;
             var end = recvBufferPtr + bytesRead;
@@ -1009,51 +1184,15 @@ namespace Garnet.server
             readHead += length + 2;
             success = true;
 
-            return result;
-        }
-
-        public ArgSlice GetCommandAsArgSlice(out bool success)
-        {
-            if (bytesRead - readHead < 6)
-            {
-                success = false;
-                return default;
-            }
-
-            Debug.Assert(*(recvBufferPtr + readHead) == '$');
-            int psize = *(recvBufferPtr + readHead + 1) - '0';
-            readHead += 2;
-            while (*(recvBufferPtr + readHead) != '\r')
-            {
-                psize = psize * 10 + *(recvBufferPtr + readHead) - '0';
-                if (bytesRead - readHead < 1)
-                {
-                    success = false;
-                    return default;
-                }
-                readHead++;
-            }
-            if (bytesRead - readHead < 2 + psize + 2)
-            {
-                success = false;
-                return default;
-            }
-            Debug.Assert(*(recvBufferPtr + readHead + 1) == '\n');
-
-            var result = new ArgSlice(recvBufferPtr + readHead + 2, psize);
-            Debug.Assert(*(recvBufferPtr + readHead + 2 + psize) == '\r');
-            Debug.Assert(*(recvBufferPtr + readHead + 2 + psize + 1) == '\n');
-
-            readHead += 2 + psize + 2;
-            success = true;
+            AsciiUtils.ToUpperInPlace(result);
             return result;
         }
 
         /// <summary>
         /// Attempt to kill this session.
-        /// 
+        ///
         /// Returns true if this call actually kills the underlying network connection.
-        /// 
+        ///
         /// Subsequent calls will return false.
         /// </summary>
         public bool TryKill()
@@ -1109,7 +1248,7 @@ namespace Garnet.server
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SendAndReset(IMemoryOwner<byte> memory, int length)
+        internal void SendAndReset(IMemoryOwner<byte> memory, int length)
         {
             // Copy allocated memory to main buffer and send
             fixed (byte* _src = memory.Memory.Span)
@@ -1151,18 +1290,6 @@ namespace Garnet.server
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void WriteDirectLargeRespString(ReadOnlySpan<byte> message)
-        {
-            while (!RespWriteUtils.TryWriteBulkStringLength(message, ref dcurr, dend))
-                SendAndReset();
-
-            WriteDirectLarge(message);
-
-            while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
-                SendAndReset();
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteDirectLarge(ReadOnlySpan<byte> src)
         {
             // Repeat while we have bytes left to write
@@ -1171,7 +1298,7 @@ namespace Garnet.server
                 // Compute space left on output buffer
                 int destSpace = (int)(dend - dcurr);
 
-                // Fast path if there is enough space 
+                // Fast path if there is enough space
                 if (src.Length <= destSpace)
                 {
                     src.CopyTo(new Span<byte>(dcurr, src.Length));
@@ -1208,7 +1335,7 @@ namespace Garnet.server
                 // Debug.WriteLine("SEND: [" + Encoding.UTF8.GetString(new Span<byte>(d, (int)(dcurr - d))).Replace("\n", "|").Replace("\r", "!") + "]");
                 if (waitForAofBlocking)
                 {
-                    var task = storeWrapper.appendOnlyFile.WaitForCommitAsync();
+                    var task = storeWrapper.WaitForCommitAsync();
                     if (!task.IsCompleted) task.AsTask().GetAwaiter().GetResult();
                 }
                 int sendBytes = (int)(dcurr - d);
@@ -1226,9 +1353,9 @@ namespace Garnet.server
 
             if ((int)(dcurr - d) > 0)
             {
-                if (storeWrapper.appendOnlyFile != null && storeWrapper.serverOptions.WaitForCommit)
+                if (storeWrapper.serverOptions.EnableAOF && storeWrapper.serverOptions.WaitForCommit)
                 {
-                    var task = storeWrapper.appendOnlyFile.WaitForCommitAsync();
+                    var task = storeWrapper.WaitForCommitAsync();
                     if (!task.IsCompleted) task.AsTask().GetAwaiter().GetResult();
                 }
                 int sendBytes = (int)(dcurr - d);
@@ -1251,33 +1378,148 @@ namespace Garnet.server
         }
 
         /// <summary>
-        /// Gets the output object from the SpanByteAndMemory object
+        /// Set the current database session
         /// </summary>
-        /// <param name="output"></param>
-        /// <returns></returns>
-        private unsafe ObjectOutputHeader ProcessOutputWithHeader(SpanByteAndMemory output)
+        /// <param name="dbId">Database ID of the current session</param>
+        /// <returns>True if successful</returns>
+        internal bool TrySwitchActiveDatabaseSession(int dbId)
         {
-            ReadOnlySpan<byte> outputSpan;
-            ObjectOutputHeader header;
+            if (!allowMultiDb)
+                return false;
 
-            if (output.IsSpanByte)
+            // Try to get or set the database session by ID
+            var dbSession = TryGetOrSetDatabaseSession(dbId, out var success);
+            if (!success)
+                return false;
+
+            // Set the active database session
+            SwitchActiveDatabaseSession(dbSession);
+            return true;
+        }
+
+        /// <summary>
+        /// Swap between two database sessions
+        /// </summary>
+        /// <param name="dbId1">Database ID of first session</param>
+        /// <param name="dbId2">Database ID of second session</param>
+        /// <returns></returns>
+        internal bool TrySwapDatabaseSessions(int dbId1, int dbId2)
+        {
+            if (!allowMultiDb)
+                return false;
+            if (dbId1 == dbId2)
+                return true;
+
+            // Try to get or set the database sessions
+            // Note that the dbIdForSessionCreation is set to the other DB ID -
+            // That is because the databases have been swapped prior to the session swap
+            var dbSession1 = TryGetOrSetDatabaseSession(dbId1, out var success, dbId2);
+            if (!success)
+                return false;
+            var dbSession2 = TryGetOrSetDatabaseSession(dbId2, out success, dbId1);
+            if (!success)
+                return false;
+
+            // Swap the sessions in the session map
+            databaseSessions.Map[dbId1] = new GarnetDatabaseSession(dbId1, dbSession2);
+            databaseSessions.Map[dbId2] = new GarnetDatabaseSession(dbId2, dbSession1);
+
+            // If Lua is enabled, switch the database sessions in the script cache
+            if (storeWrapper.serverOptions.EnableLua)
+                sessionScriptCache?.TrySwapDatabaseSessions(dbId1, dbId2);
+
+            // If any of the IDs are the current active database ID -
+            // Set the new active database session to the swapped session
+            if (activeDbId == dbId1)
+                SwitchActiveDatabaseSession(databaseSessions.Map[dbId1]);
+            else if (activeDbId == dbId2)
+                SwitchActiveDatabaseSession(databaseSessions.Map[dbId2]);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Try to retrieve or create a new database session by DB ID
+        /// </summary>
+        /// <param name="dbId">Database ID of the session</param>
+        /// <param name="success">True if successful</param>
+        /// <param name="dbIdForSessionCreation">Database ID session creation (defaults to dbId, this option is used for SWAPDB only)</param>
+        /// <returns>Reference to the retrieved or created database session</returns>
+        private GarnetDatabaseSession TryGetOrSetDatabaseSession(int dbId, out bool success, int dbIdForSessionCreation = -1)
+        {
+            success = false;
+            if (dbIdForSessionCreation == -1)
+                dbIdForSessionCreation = dbId;
+
+            var databaseSessionsMapSize = databaseSessions.ActualSize;
+            var databaseSessionsMapSnapshot = databaseSessions.Map;
+
+            // If database already exists, return
+            if (dbId >= 0 && dbId < databaseSessionsMapSize && databaseSessionsMapSnapshot[dbId] != null)
             {
-                header = *(ObjectOutputHeader*)(output.SpanByte.ToPointer() + output.Length - sizeof(ObjectOutputHeader));
-
-                // Only increment dcurr if the operation was completed
-                dcurr += output.Length - sizeof(ObjectOutputHeader);
+                success = true;
+                return databaseSessionsMapSnapshot[dbId];
             }
-            else
+
+            // Take a lock on the database sessions map (this is required since this method can be called from a thread-unsafe context)
+            databaseSessions.mapLock.WriteLock();
+
+            try
             {
-                outputSpan = output.Memory.Memory.Span;
-                fixed (byte* p = outputSpan)
+                // If database already exists, return
+                if (dbId >= 0 && dbId < databaseSessionsMapSize && databaseSessionsMapSnapshot[dbId] != null)
                 {
-                    header = *(ObjectOutputHeader*)(p + output.Length - sizeof(ObjectOutputHeader));
+                    success = true;
+                    return databaseSessionsMapSnapshot[dbId];
                 }
-                SendAndReset(output.Memory, output.Length - sizeof(ObjectOutputHeader));
-            }
 
-            return header;
+                // Create a new database session and set it in the sessions map
+                var dbSession = CreateDatabaseSession(dbIdForSessionCreation);
+                if (!databaseSessions.TrySetValueUnsafe(dbId, ref dbSession, false))
+                    return default;
+
+                // Update the session map snapshot and return a reference to the inserted session
+                success = true;
+                databaseSessionsMapSnapshot = databaseSessions.Map;
+                return databaseSessionsMapSnapshot[dbId];
+            }
+            finally
+            {
+                databaseSessions.mapLock.WriteUnlock();
+            }
+        }
+
+        /// <summary>
+        /// Create a new database session
+        /// </summary>
+        /// <param name="dbId">Database ID</param>
+        /// <returns>New database session</returns>
+        private GarnetDatabaseSession CreateDatabaseSession(int dbId)
+        {
+            var dbStorageSession = new StorageSession(storeWrapper, scratchBufferBuilder, sessionMetrics, LatencyMetrics, dbId, logger, respProtocolVersion);
+            var dbGarnetApi = new BasicGarnetApi(dbStorageSession, dbStorageSession.basicContext, dbStorageSession.objectStoreBasicContext);
+            var dbLockableGarnetApi = new LockableGarnetApi(dbStorageSession, dbStorageSession.lockableContext, dbStorageSession.objectStoreLockableContext);
+
+            var transactionManager = new TransactionManager(storeWrapper, this, dbGarnetApi, dbLockableGarnetApi,
+                dbStorageSession, scratchBufferAllocator, storeWrapper.serverOptions.EnableCluster, logger, dbId);
+            dbStorageSession.txnManager = transactionManager;
+
+            return new GarnetDatabaseSession(dbId, dbStorageSession, dbGarnetApi, dbLockableGarnetApi, transactionManager);
+        }
+
+        /// <summary>
+        /// Switch current active database session
+        /// </summary>
+        /// <param name="dbSession">Database Session</param>
+        private void SwitchActiveDatabaseSession(GarnetDatabaseSession dbSession)
+        {
+            this.activeDbId = dbSession.Id;
+            this.txnManager = dbSession.TransactionManager;
+            this.storageSession = dbSession.StorageSession;
+            this.basicGarnetApi = dbSession.GarnetApi;
+            this.lockableGarnetApi = dbSession.LockableGarnetApi;
+
+            this.storageSession.UpdateRespProtocolVersion(this.respProtocolVersion);
         }
     }
 }

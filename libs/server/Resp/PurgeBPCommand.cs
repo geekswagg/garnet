@@ -54,9 +54,7 @@ namespace Garnet.server
 
             if (!parseState.TryGetManagerType(0, out var managerType))
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_SYNTAX_ERROR, ref dcurr, dend))
-                    SendAndReset();
-                return true;
+                return AbortWithErrorMessage(CmdStrings.RESP_SYNTAX_ERROR);
             }
 
             try
@@ -69,7 +67,8 @@ namespace Garnet.server
                         success = ClusterPurgeBufferPool(managerType);
                         break;
                     case ManagerType.ServerListener:
-                        storeWrapper.TcpServer.Purge();
+                        foreach (var server in storeWrapper.Servers)
+                            ((GarnetServerTcp)server).Purge();
                         break;
                     default:
                         success = false;
