@@ -31,6 +31,12 @@ namespace Tsavorite.core
     public interface ICheckpointManager : IDisposable
     {
         /// <summary>
+        /// Get current cookie
+        /// </summary>
+        /// <returns></returns>
+        byte[] GetCookie();
+
+        /// <summary>
         /// Initialize index checkpoint
         /// </summary>
         /// <param name="indexToken"></param>
@@ -51,28 +57,53 @@ namespace Tsavorite.core
         void CommitIndexCheckpoint(Guid indexToken, byte[] commitMetadata);
 
         /// <summary>
+        /// Cleanup index checkpoint
+        /// </summary>
+        /// <param name="indexToken"></param>
+        void CleanupIndexCheckpoint(Guid indexToken);
+
+        /// <summary>
         /// Commit log checkpoint (snapshot and fold-over)
         /// </summary>
         /// <param name="logToken"></param>
         /// <param name="commitMetadata"></param>
-        /// <returns></returns>
-        void CommitLogCheckpoint(Guid logToken, byte[] commitMetadata);
+        void CommitLogCheckpointMetadata(Guid logToken, byte[] commitMetadata);
 
         /// <summary>
-        /// Callback to indicate version shift during checkpoint
+        /// Cleanup log checkpoint
+        /// </summary>
+        /// <param name="logToken"></param>
+        void CleanupLogCheckpoint(Guid logToken);
+
+        /// <summary>
+        /// Callback to indicate start of version shift during checkpoint
         /// </summary>
         /// <param name="oldVersion"></param>
         /// <param name="newVersion"></param>
-        void CheckpointVersionShift(long oldVersion, long newVersion);
+        /// <param name="isStreaming"></param>
+        void CheckpointVersionShiftStart(long oldVersion, long newVersion, bool isStreaming);
+
+        /// <summary>
+        /// Callback to indicate end of version shift during checkpoint
+        /// </summary>
+        /// <param name="oldVersion"></param>
+        /// <param name="newVersion"></param>
+        /// <param name="isStreaming"></param>
+        void CheckpointVersionShiftEnd(long oldVersion, long newVersion, bool isStreaming);
 
         /// <summary>
         /// Commit log incremental checkpoint (incremental snapshot)
         /// </summary>
         /// <param name="logToken"></param>
-        /// <param name="version"></param>
         /// <param name="commitMetadata"></param>
         /// <param name="deltaLog"></param>
-        void CommitLogIncrementalCheckpoint(Guid logToken, long version, byte[] commitMetadata, DeltaLog deltaLog);
+        void CommitLogIncrementalCheckpoint(Guid logToken, byte[] commitMetadata, DeltaLog deltaLog);
+
+        /// <summary>
+        /// Cleanup log incremental checkpoint (incremental snapshot)
+        /// </summary>
+        /// <param name="logToken"></param>
+        void CleanupLogIncrementalCheckpoint(Guid logToken);
 
         /// <summary>
         /// Retrieve commit metadata for specified index checkpoint

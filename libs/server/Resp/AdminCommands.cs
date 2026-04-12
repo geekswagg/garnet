@@ -9,8 +9,8 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Garnet.common;
-using Garnet.server.Auth.Settings;
 using Garnet.server.Custom;
+using Microsoft.Extensions.Logging;
 
 namespace Garnet.server
 {
@@ -54,13 +54,16 @@ namespace Garnet.server
                 RespCommand.SLOWLOG_RESET => NetworkSlowLogReset(),
                 RespCommand.ROLE => NetworkROLE(),
                 RespCommand.SAVE => NetworkSAVE(),
+                RespCommand.EXPDELSCAN => NetworkEXPDELSCAN(),
                 RespCommand.LASTSAVE => NetworkLASTSAVE(),
                 RespCommand.BGSAVE => NetworkBGSAVE(),
                 RespCommand.COMMITAOF => NetworkCOMMITAOF(),
                 RespCommand.FORCEGC => NetworkFORCEGC(),
                 RespCommand.HCOLLECT => NetworkHCOLLECT(ref storageApi),
+                RespCommand.ZCOLLECT => NetworkZCOLLECT(ref storageApi),
                 RespCommand.MONITOR => NetworkMonitor(),
                 RespCommand.ACL_DELUSER => NetworkAclDelUser(),
+                RespCommand.ACL_GENPASS => NetworkAclGenPass(),
                 RespCommand.ACL_GETUSER => NetworkAclGetUser(),
                 RespCommand.ACL_LIST => NetworkAclList(),
                 RespCommand.ACL_LOAD => NetworkAclLoad(),
@@ -162,9 +165,9 @@ namespace Garnet.server
             }
         }
 
-        void CommitAof()
+        void CommitAof(int dbId = -1)
         {
-            storeWrapper.appendOnlyFile?.CommitAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+            storeWrapper.CommitAOFAsync(dbId).ConfigureAwait(false).GetAwaiter().GetResult();
         }
 
         private bool NetworkMonitor()
@@ -353,6 +356,16 @@ namespace Garnet.server
         /// </summary>
         private bool NetworkRegisterCs(CustomCommandManager customCommandManager)
         {
+            if (parseState.Count < 6)
+            {
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.REGISTERCS));
+            }
+
+            if (!CanRunModule())
+            {
+                return AbortWithErrorMessage(CmdStrings.GenericErrCommandDisallowedWithOption, RespCommand.REGISTERCS, "enable-module-command");
+            }
+
             var readPathsOnly = false;
             var optionalParamsRead = 0;
 
@@ -364,9 +377,6 @@ namespace Garnet.server
             var classNameToRegisterArgs = new Dictionary<string, List<RegisterArgsBase>>();
 
             ReadOnlySpan<byte> errorMsg = null;
-
-            if (parseState.Count < 6)
-                errorMsg = CmdStrings.RESP_ERR_GENERIC_MALFORMED_REGISTERCS_COMMAND;
 
             // Parse the REGISTERCS command - list of registration sub-commands
             // followed by an optional path to JSON file containing an array of RespCommandsInfo objects,
@@ -517,8 +527,12 @@ namespace Garnet.server
         {
             if (parseState.Count < 1) // At least module path is required
             {
-                AbortWithWrongNumberOfArguments($"{RespCommand.MODULE}|{Encoding.ASCII.GetString(CmdStrings.LOADCS)}");
-                return true;
+                return AbortWithWrongNumberOfArguments($"{RespCommand.MODULE}|{Encoding.ASCII.GetString(CmdStrings.LOADCS)}");
+            }
+
+            if (!CanRunModule())
+            {
+                return AbortWithErrorMessage(CmdStrings.GenericErrCommandDisallowedWithOption, RespCommand.MODULE, "enable-module-command");
             }
 
             // Read path to module file
@@ -542,8 +556,7 @@ namespace Garnet.server
             {
                 if (!errorMsg.IsEmpty)
                 {
-                    while (!RespWriteUtils.TryWriteError(errorMsg, ref dcurr, dend))
-                        SendAndReset();
+                    WriteError(errorMsg);
                 }
 
                 return true;
@@ -566,21 +579,34 @@ namespace Garnet.server
 
             if (!errorMsg.IsEmpty)
             {
-                while (!RespWriteUtils.TryWriteError(errorMsg, ref dcurr, dend))
-                    SendAndReset();
+                WriteError(errorMsg);
             }
 
             return true;
         }
 
+        /// <summary>
+        /// COMMITAOF [DBID]
+        /// </summary>
+        /// <returns></returns>
         private bool NetworkCOMMITAOF()
         {
-            if (parseState.Count != 0)
+            if (parseState.Count > 1)
             {
                 return AbortWithWrongNumberOfArguments(nameof(RespCommand.COMMITAOF));
             }
 
-            CommitAof();
+            // By default - commit AOF for all active databases, unless database ID specified
+            var dbId = -1;
+
+            // Check if ID specified
+            if (parseState.Count == 1)
+            {
+                if (!TryParseDatabaseId(0, out dbId))
+                    return true;
+            }
+
+            CommitAof(dbId);
             while (!RespWriteUtils.TryWriteSimpleString("AOF file committed"u8, ref dcurr, dend))
                 SendAndReset();
 
@@ -599,9 +625,7 @@ namespace Garnet.server
             {
                 if (!parseState.TryGetInt(0, out generation) || generation < 0 || generation > GC.MaxGeneration)
                 {
-                    while (!RespWriteUtils.TryWriteError("ERR Invalid GC generation."u8, ref dcurr, dend))
-                        SendAndReset();
-                    return true;
+                    return AbortWithErrorMessage("ERR Invalid GC generation."u8);
                 }
             }
 
@@ -642,13 +666,41 @@ namespace Garnet.server
             return true;
         }
 
+        private bool NetworkZCOLLECT<TGarnetApi>(ref TGarnetApi storageApi)
+            where TGarnetApi : IGarnetApi
+        {
+            if (parseState.Count < 1)
+            {
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.ZCOLLECT));
+            }
+
+            var keys = parseState.Parameters;
+
+            var header = new RespInputHeader(GarnetObjectType.SortedSet) { SortedSetOp = SortedSetOperation.ZCOLLECT };
+            var input = new ObjectInput(header);
+
+            var status = storageApi.SortedSetCollect(keys, ref input);
+
+            switch (status)
+            {
+                case GarnetStatus.OK:
+                    while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                        SendAndReset();
+                    break;
+                default:
+                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_ZCOLLECT_ALREADY_IN_PROGRESS, ref dcurr, dend))
+                        SendAndReset();
+                    break;
+            }
+
+            return true;
+        }
+
         private bool NetworkProcessClusterCommand(RespCommand command)
         {
             if (clusterSession == null)
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_CLUSTER_DISABLED, ref dcurr, dend))
-                    SendAndReset();
-                return true;
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_GENERIC_CLUSTER_DISABLED);
             }
 
             clusterSession.ProcessClusterCommands(command, ref parseState, ref dcurr, ref dend);
@@ -659,77 +711,71 @@ namespace Garnet.server
         {
             if (parseState.Count == 0)
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_WRONG_NUMBER_OF_ARGUMENTS, ref dcurr, dend))
-                    SendAndReset();
-
-                return true;
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.DEBUG));
             }
 
-            if (
-                    (storeWrapper.serverOptions.EnableDebugCommand == ConnectionProtectionOption.No)
-                 || (
-                        (storeWrapper.serverOptions.EnableDebugCommand == ConnectionProtectionOption.Local)
-                      && !networkSender.IsLocalConnection()
-                    )
-               )
+            if (!CanRunDebug())
             {
-                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_DEUBG_DISALLOWED, ref dcurr, dend))
-                    SendAndReset();
-
-                return true;
+                return AbortWithErrorMessage(CmdStrings.GenericErrCommandDisallowedWithOption, RespCommand.DEBUG, "enable-debug-command");
             }
 
             var command = parseState.GetArgSliceByRef(0).ReadOnlySpan;
 
             if (command.EqualsUpperCaseSpanIgnoringCase(CmdStrings.PANIC))
                 // Throwing an exception is intentional and desirable for this command.
-                throw new GarnetException(Microsoft.Extensions.Logging.LogLevel.Debug, panic: true);
+                throw new GarnetException(LogLevel.Debug, panic: true);
 
             if (command.EqualsUpperCaseSpanIgnoringCase(CmdStrings.ERROR))
             {
                 if (parseState.Count != 2)
                 {
-                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_WRONG_NUMBER_OF_ARGUMENTS, ref dcurr, dend))
-                        SendAndReset();
-
-                    return true;
+                    return AbortWithWrongNumberOfArgumentsOrUnknownSubcommand(Encoding.ASCII.GetString(command),
+                                                                              nameof(RespCommand.DEBUG));
                 }
 
-                while (!RespWriteUtils.TryWriteError(parseState.GetString(1), ref dcurr, dend))
-                    SendAndReset();
+                WriteError(parseState.GetString(1));
+                return true;
+            }
+
+            if (command.EqualsUpperCaseSpanIgnoringCase(CmdStrings.LOG))
+            {
+                if (parseState.Count != 2)
+                {
+                    return AbortWithWrongNumberOfArgumentsOrUnknownSubcommand(Encoding.ASCII.GetString(command),
+                                                                              nameof(RespCommand.DEBUG));
+                }
+
+                logger?.LogInformation("DEBUG LOG: {LOG}", parseState.GetString(1));
+
+                WriteDirect(CmdStrings.RESP_OK);
                 return true;
             }
 
             if (command.EqualsUpperCaseSpanIgnoringCase(CmdStrings.HELP))
             {
-                var help = new List<string>()
+                var help = new string[]
                 {
                     "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                    "PANIC",
-                    "\tCrash the server simulating a panic.",
                     "ERROR <string>",
                     "\tReturn a Redis protocol error with <string> as message. Useful for clients",
                     "\tunit tests to simulate Redis errors.",
+                    "LOG <message>",
+                    "\tWrite <message> to the server log.",
+                    "PANIC",
+                    "\tCrash the server simulating a panic.",
                     "HELP",
                     "\tPrints this help"
                 };
 
-                while (!RespWriteUtils.TryWriteArrayLength(help.Count, ref dcurr, dend))
-                    SendAndReset();
-
+                WriteArrayLength(help.Length);
                 foreach (var line in help)
                 {
-                    while (!RespWriteUtils.TryWriteSimpleString(line, ref dcurr, dend))
-                        SendAndReset();
+                    WriteSimpleString(line);
                 }
-
                 return true;
             }
 
-            var error = string.Format(CmdStrings.GenericErrUnknownSubCommand, parseState.GetString(0), nameof(RespCommand.DEBUG));
-            while (!RespWriteUtils.TryWriteError(error, ref dcurr, dend))
-                SendAndReset();
-
+            WriteError(string.Format(CmdStrings.GenericErrUnknownSubCommand, parseState.GetString(0), nameof(RespCommand.DEBUG)));
             return true;
         }
 
@@ -811,16 +857,30 @@ namespace Garnet.server
             return true;
         }
 
+        /// <summary>
+        /// SAVE [DBID]
+        /// </summary>
+        /// <returns></returns>
         private bool NetworkSAVE()
         {
-            if (parseState.Count != 0)
+            if (parseState.Count > 1)
             {
                 return AbortWithWrongNumberOfArguments(nameof(RespCommand.SAVE));
             }
 
-            if (!storeWrapper.TakeCheckpoint(false, StoreType.All, logger))
+            // By default - save all active databases, unless database ID specified
+            var dbId = -1;
+
+            // Check if ID specified
+            if (parseState.Count == 1)
             {
-                while (!RespWriteUtils.TryWriteError("ERR checkpoint already in progress"u8, ref dcurr, dend))
+                if (!TryParseDatabaseId(0, out dbId))
+                    return true;
+            }
+
+            if (!storeWrapper.TakeCheckpoint(false, dbId: dbId, logger: logger))
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_CHECKPOINT_ALREADY_IN_PROGRESS, ref dcurr, dend))
                     SendAndReset();
             }
             else
@@ -832,28 +892,110 @@ namespace Garnet.server
             return true;
         }
 
-        private bool NetworkLASTSAVE()
+        /// <summary>
+        /// EXPDELSCAN [DBID]
+        /// Scan the mutable region and delete all expired keys.
+        /// This is meant to be able to let users do on-demand expiration, and even build their own schedulers
+        /// for calling expiration based on their known workload patterns.
+        /// </summary>
+        private bool NetworkEXPDELSCAN()
         {
-            if (parseState.Count != 0)
+            if (parseState.Count > 1)
             {
-                return AbortWithWrongNumberOfArguments(nameof(RespCommand.SAVE));
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.EXPDELSCAN));
             }
 
-            var seconds = storeWrapper.lastSaveTime.ToUnixTimeSeconds();
+            if (storeWrapper.serverOptions.ExpiredKeyDeletionScanFrequencySecs > 0)
+            {
+                return AbortWithErrorMessage(CmdStrings.RESP_ERR_EXPDELSCAN_INVALID);
+            }
+
+            // Default database as default choice.
+            int dbId = 0;
+            if (parseState.Count > 0)
+            {
+                if (!TryParseDatabaseId(0, out dbId))
+                    return true;
+            }
+
+            (var recordsExpired, var recordsScanned) = storeWrapper.ExpiredKeyDeletionScan(dbId);
+
+            // Resp Response Format => *2\r\n$NUM1\r\n$NUM2\r\n
+            int requiredSpace = 5 + NumUtils.CountDigits(recordsExpired) + 3 + NumUtils.CountDigits(recordsScanned) + 2;
+
+            while (!RespWriteUtils.TryWriteArrayLength(2, ref dcurr, dend))
+                SendAndReset();
+
+            while (!RespWriteUtils.TryWriteArrayItem(recordsExpired, ref dcurr, dend))
+                SendAndReset();
+
+            while (!RespWriteUtils.TryWriteArrayItem(recordsScanned, ref dcurr, dend))
+                SendAndReset();
+
+            return true;
+        }
+
+        /// <summary>
+        /// LASTSAVE [DBID]
+        /// </summary>
+        /// <returns></returns>
+        private bool NetworkLASTSAVE()
+        {
+            if (parseState.Count > 1)
+            {
+                return AbortWithWrongNumberOfArguments(nameof(RespCommand.LASTSAVE));
+            }
+
+            // By default - get the last saved timestamp for current active database, unless database ID specified
+            var dbId = activeDbId;
+
+            // Check if ID specified
+            if (parseState.Count == 1)
+            {
+                if (!TryParseDatabaseId(0, out dbId))
+                    return true;
+            }
+
+            var dbFound = storeWrapper.TryGetOrAddDatabase(dbId, out var db, out _);
+            Debug.Assert(dbFound);
+
+            var seconds = db.LastSaveTime.ToUnixTimeSeconds();
             while (!RespWriteUtils.TryWriteInt64(seconds, ref dcurr, dend))
                 SendAndReset();
 
             return true;
         }
 
+        /// <summary>
+        /// BGSAVE [SCHEDULE] [DBID]
+        /// </summary>
+        /// <returns></returns>
         private bool NetworkBGSAVE()
         {
-            if (parseState.Count > 1)
+            if (parseState.Count > 2)
             {
                 return AbortWithWrongNumberOfArguments(nameof(RespCommand.BGSAVE));
             }
 
-            var success = storeWrapper.TakeCheckpoint(true, StoreType.All, logger);
+            // By default - save all active databases, unless database ID specified
+            var dbId = -1;
+
+            var tokenIdx = 0;
+            if (parseState.Count > 0)
+            {
+                if (parseState.GetArgSliceByRef(tokenIdx).ReadOnlySpan
+                    .EqualsUpperCaseSpanIgnoringCase(CmdStrings.SCHEDULE))
+                    tokenIdx++;
+
+                // Check if ID specified
+                if (parseState.Count - tokenIdx > 0)
+                {
+                    if (!TryParseDatabaseId(tokenIdx, out dbId))
+                        return true;
+                }
+            }
+
+            var success = storeWrapper.TakeCheckpoint(true, dbId: dbId, logger: logger);
             if (success)
             {
                 while (!RespWriteUtils.TryWriteSimpleString("Background saving started"u8, ref dcurr, dend))
@@ -861,8 +1003,36 @@ namespace Garnet.server
             }
             else
             {
-                while (!RespWriteUtils.TryWriteError("ERR checkpoint already in progress"u8, ref dcurr, dend))
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_CHECKPOINT_ALREADY_IN_PROGRESS, ref dcurr, dend))
                     SendAndReset();
+            }
+
+            return true;
+        }
+
+        private bool TryParseDatabaseId(int tokenIdx, out int dbId)
+        {
+            dbId = -1;
+            if (!parseState.TryGetInt(tokenIdx, out dbId))
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER, ref dcurr, dend))
+                    SendAndReset();
+                return false;
+            }
+
+            if (dbId > 0 && storeWrapper.serverOptions.EnableCluster)
+            {
+                // Cluster mode does not allow DBID specification
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_DB_ID_CLUSTER_MODE, ref dcurr, dend))
+                    SendAndReset();
+                return false;
+            }
+
+            if (dbId >= storeWrapper.serverOptions.MaxDatabases || dbId < 0)
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_DB_INDEX_OUT_OF_RANGE, ref dcurr, dend))
+                    SendAndReset();
+                return false;
             }
 
             return true;

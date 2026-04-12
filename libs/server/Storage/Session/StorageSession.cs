@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 using System;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Tsavorite.core;
 
@@ -41,10 +42,11 @@ namespace Garnet.server
         public BasicContext<byte[], IGarnetObject, ObjectInput, GarnetObjectStoreOutput, long, ObjectSessionFunctions, ObjectStoreFunctions, ObjectStoreAllocator> objectStoreBasicContext;
         public LockableContext<byte[], IGarnetObject, ObjectInput, GarnetObjectStoreOutput, long, ObjectSessionFunctions, ObjectStoreFunctions, ObjectStoreAllocator> objectStoreLockableContext;
 
-        public readonly ScratchBufferManager scratchBufferManager;
+        public readonly ScratchBufferBuilder scratchBufferBuilder;
         public readonly FunctionsState functionsState;
 
         public TransactionManager txnManager;
+        public StateMachineDriver stateMachineDriver;
         readonly ILogger logger;
         private readonly CollectionItemBroker itemBroker;
 
@@ -54,26 +56,32 @@ namespace Garnet.server
         public readonly int ObjectScanCountLimit;
 
         public StorageSession(StoreWrapper storeWrapper,
-            ScratchBufferManager scratchBufferManager,
+            ScratchBufferBuilder scratchBufferBuilder,
             GarnetSessionMetrics sessionMetrics,
             GarnetLatencyMetricsSession LatencyMetrics,
-            ILogger logger = null)
+            int dbId,
+            ILogger logger = null,
+            byte respProtocolVersion = ServerOptions.DEFAULT_RESP_VERSION)
         {
             this.sessionMetrics = sessionMetrics;
             this.LatencyMetrics = LatencyMetrics;
-            this.scratchBufferManager = scratchBufferManager;
+            this.scratchBufferBuilder = scratchBufferBuilder;
             this.logger = logger;
             this.itemBroker = storeWrapper.itemBroker;
-
             parseState.Initialize();
 
-            functionsState = storeWrapper.CreateFunctionsState();
+            functionsState = storeWrapper.CreateFunctionsState(dbId, respProtocolVersion);
 
             var functions = new MainSessionFunctions(functionsState);
-            var session = storeWrapper.store.NewSession<RawStringInput, SpanByteAndMemory, long, MainSessionFunctions>(functions);
 
-            var objstorefunctions = new ObjectSessionFunctions(functionsState);
-            var objectStoreSession = storeWrapper.objectStore?.NewSession<ObjectInput, GarnetObjectStoreOutput, long, ObjectSessionFunctions>(objstorefunctions);
+            var dbFound = storeWrapper.TryGetDatabase(dbId, out var db);
+            Debug.Assert(dbFound);
+
+            this.stateMachineDriver = db.StateMachineDriver;
+            var session = db.MainStore.NewSession<RawStringInput, SpanByteAndMemory, long, MainSessionFunctions>(functions);
+
+            var objectStoreFunctions = new ObjectSessionFunctions(functionsState);
+            var objectStoreSession = db.ObjectStore?.NewSession<ObjectInput, GarnetObjectStoreOutput, long, ObjectSessionFunctions>(objectStoreFunctions);
 
             basicContext = session.BasicContext;
             lockableContext = session.LockableContext;
@@ -83,12 +91,20 @@ namespace Garnet.server
                 objectStoreLockableContext = objectStoreSession.LockableContext;
             }
 
-            HeadAddress = storeWrapper.store.Log.HeadAddress;
+            HeadAddress = db.MainStore.Log.HeadAddress;
             ObjectScanCountLimit = storeWrapper.serverOptions.ObjectScanCountLimit;
+        }
+
+        public void UpdateRespProtocolVersion(byte respProtocolVersion)
+        {
+            functionsState.respProtocolVersion = respProtocolVersion;
         }
 
         public void Dispose()
         {
+            _zcollectTaskLock.CloseLock();
+            _hcollectTaskLock.CloseLock();
+
             sectorAlignedMemoryBitmap?.Dispose();
             basicContext.Session.Dispose();
             objectStoreBasicContext.Session?.Dispose();

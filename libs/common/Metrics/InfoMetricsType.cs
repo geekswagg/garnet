@@ -78,6 +78,14 @@ namespace Garnet.common
         /// Shared buffer pool stats
         /// </summary>
         BPSTATS,
+        /// <summary>
+        /// Checkpoint information used for cluster
+        /// </summary>
+        CINFO,
+        /// <summary>
+        /// Scan and return distribution of in-memory portion of hybrid logs for main store and object store
+        /// </summary>
+        HLOGSCAN,
     }
 
     /// <summary>
@@ -85,8 +93,7 @@ namespace Garnet.common
     /// </summary>
     public static class InfoCommandUtils
     {
-        static readonly byte[][] infoSections = Enum.GetValues<InfoMetricsType>()
-            .Select(x => Encoding.ASCII.GetBytes($"${x.ToString().Length}\r\n{x}\r\n")).ToArray();
+        static readonly byte[][] infoSections = [.. Enum.GetValues<InfoMetricsType>().Select(x => Encoding.ASCII.GetBytes($"${x.ToString().Length}\r\n{x}\r\n"))];
 
         /// <summary>
         /// Return resp formatted info section

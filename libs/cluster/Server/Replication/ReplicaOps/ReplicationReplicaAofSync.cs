@@ -35,9 +35,9 @@ namespace Garnet.cluster
             var currentConfig = clusterProvider.clusterManager.CurrentConfig;
             try
             {
-                if (clusterProvider.replicationManager.Recovering)
+                if (clusterProvider.replicationManager.CannotStreamAOF)
                 {
-                    logger?.LogWarning("Replica is recovering cannot sync AOF");
+                    logger?.LogError("Replica is recovering cannot sync AOF");
                     throw new GarnetException("Replica is recovering cannot sync AOF", LogLevel.Warning, clientResponse: false);
                 }
 
@@ -64,6 +64,9 @@ namespace Garnet.cluster
                         }
                     }
                 }
+
+                // Injection for a "something went wrong with THIS Replica's AOF file"
+                ExceptionInjectionHelper.TriggerException(ExceptionInjectionType.Divergent_AOF_Stream);
 
                 var tail = storeWrapper.appendOnlyFile.TailAddress;
                 var nextPageBeginAddress = ((tail >> pageSizeBits) + 1) << pageSizeBits;

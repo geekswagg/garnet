@@ -16,6 +16,7 @@ using Microsoft.Extensions.Logging;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using StackExchange.Redis;
+using Tsavorite.core;
 
 namespace Garnet.test.cluster
 {
@@ -24,6 +25,7 @@ namespace Garnet.test.cluster
         public CredentialManager credManager;
         public string TestFolder;
         public GarnetServer[] nodes = null;
+        public GarnetServerOptions[] nodeOptions = null;
         public EndPointCollection endpoints;
         public TextWriter logTextWriter = TestContext.Progress;
         public ILoggerFactory loggerFactory;
@@ -57,6 +59,65 @@ namespace Garnet.test.cluster
             credManager = new CredentialManager();
         }
 
+        public void ShutdownNode(IPEndPoint endpoint)
+        {
+            for (var i = 0; i < endpoints.Count; i++)
+            {
+                if (endpoints[i] == endpoint)
+                {
+                    ShutdownNode(i);
+                    return;
+                }
+            }
+
+            throw new InvalidOperationException($"Could not find node for {endpoint}");
+        }
+
+        public void ShutdownNode(int nodeIndex)
+        {
+            if (nodeIndex < 0 || nodeIndex >= nodes.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(nodeIndex));
+            }
+
+            nodes[nodeIndex].Dispose();
+            nodes[nodeIndex] = null;
+        }
+
+        public void RestartNode(IPEndPoint endpoint)
+        {
+            for (var i = 0; i < endpoints.Count; i++)
+            {
+                if (endpoints[i] == endpoint)
+                {
+                    RestartNode(i);
+                    return;
+                }
+            }
+
+            throw new InvalidOperationException($"Could not find node for {endpoint}");
+        }
+
+        public void RestartNode(int nodeIndex)
+        {
+            if (nodeIndex < 0 || nodeIndex >= nodes.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(nodeIndex));
+            }
+
+            if (nodes[nodeIndex] != null)
+            {
+                ShutdownNode(nodeIndex);
+            }
+
+            // We're restarting, leave state unaltered
+            nodeOptions[nodeIndex].CleanClusterConfig = false;
+
+            nodes[nodeIndex] = new GarnetServer(nodeOptions[nodeIndex], loggerFactory);
+            nodes[nodeIndex].Start();
+        }
+
+
         public void TearDown()
         {
             cts.Cancel();
@@ -67,9 +128,15 @@ namespace Garnet.test.cluster
             loggerFactory?.Dispose();
             var timeoutSeconds = 5;
             if (!Task.Run(() => DisposeCluster()).Wait(TimeSpan.FromSeconds(timeoutSeconds)))
+            {
                 logger?.LogError("Timed out waiting for DisposeCluster");
+                Assert.Fail("Timed out waiting for DisposeCluster");
+            }
             if (!Task.Run(() => TestUtils.DeleteDirectory(TestFolder, true)).Wait(TimeSpan.FromSeconds(timeoutSeconds)))
-                logger?.LogError("Timed out waiting for DisposeCluster");
+            {
+                logger?.LogError("Timed out DeleteDirectory");
+                Assert.Fail("Timed out DeleteDirectory");
+            }
         }
 
         public void RegisterCustomTxn(string name, Func<CustomTransactionProcedure> proc, RespCommandsInfo commandInfo = null, RespCommandDocs commandDocs = null)
@@ -82,6 +149,7 @@ namespace Garnet.test.cluster
         /// Create instances with provided configuration
         /// </summary>
         /// <param name="shards"></param>
+        /// <param name="enableCluster"></param>
         /// <param name="cleanClusterConfig"></param>
         /// <param name="tryRecover"></param>
         /// <param name="disableObjects"></param>
@@ -111,8 +179,10 @@ namespace Garnet.test.cluster
         /// <param name="luaMemoryMode"></param>
         /// <param name="luaMemoryLimit"></param>
         /// <param name="useHostname"></param>
+        /// <param name="luaTransactionMode"></param>
         public void CreateInstances(
             int shards,
+            bool enableCluster = true,
             bool cleanClusterConfig = true,
             bool tryRecover = false,
             bool disableObjects = false,
@@ -125,6 +195,7 @@ namespace Garnet.test.cluster
             bool OnDemandCheckpoint = false,
             string AofMemorySize = "64m",
             int CommitFrequencyMs = 0,
+            bool useAofNullDevice = false,
             bool DisableStorageTier = false,
             bool EnableIncrementalSnapshots = false,
             bool FastCommit = true,
@@ -139,18 +210,32 @@ namespace Garnet.test.cluster
             bool enableLua = false,
             bool asyncReplay = false,
             bool enableDisklessSync = false,
+            int replicaDisklessSyncDelay = 1,
+            string replicaDisklessSyncFullSyncAofThreshold = null,
             LuaMemoryManagementMode luaMemoryMode = LuaMemoryManagementMode.Native,
             string luaMemoryLimit = "",
-            bool useHostname = false)
+            bool useHostname = false,
+            bool luaTransactionMode = false,
+            DeviceType deviceType = DeviceType.Default,
+            int clusterReplicationReestablishmentTimeout = 0,
+            string aofSizeLimit = "",
+            int compactionFrequencySecs = 0,
+            LogCompactionType compactionType = LogCompactionType.Scan,
+            bool latencyMonitory = false,
+            int loggingFrequencySecs = 5,
+            int checkpointThrottleFlushDelayMs = 0,
+            bool clusterReplicaResumeWithData = false,
+            int replicaSyncTimeout = 60)
         {
             var ipAddress = IPAddress.Loopback;
             TestUtils.EndPoint = new IPEndPoint(ipAddress, 7000);
             endpoints = TestUtils.GetShardEndPoints(shards, useHostname ? IPAddress.Any : ipAddress, 7000);
 
-            nodes = TestUtils.CreateGarnetCluster(
+            (nodes, nodeOptions) = TestUtils.CreateGarnetCluster(
                 TestFolder,
                 disablePubSub: disablePubSub,
                 disableObjects: disableObjects,
+                enableCluster: enableCluster,
                 endpoints: endpoints,
                 enableAOF: enableAOF,
                 timeout: timeout,
@@ -165,6 +250,7 @@ namespace Garnet.test.cluster
                 FastAofTruncate: FastAofTruncate,
                 AofMemorySize: AofMemorySize,
                 CommitFrequencyMs: CommitFrequencyMs,
+                useAofNullDevice: useAofNullDevice,
                 DisableStorageTier: DisableStorageTier,
                 OnDemandCheckpoint: OnDemandCheckpoint,
                 EnableIncrementalSnapshots: EnableIncrementalSnapshots,
@@ -179,8 +265,21 @@ namespace Garnet.test.cluster
                 enableLua: enableLua,
                 asyncReplay: asyncReplay,
                 enableDisklessSync: enableDisklessSync,
+                replicaDisklessSyncDelay: replicaDisklessSyncDelay,
+                replicaDisklessSyncFullSyncAofThreshold: replicaDisklessSyncFullSyncAofThreshold,
                 luaMemoryMode: luaMemoryMode,
-                luaMemoryLimit: luaMemoryLimit);
+                luaMemoryLimit: luaMemoryLimit,
+                luaTransactionMode: luaTransactionMode,
+                deviceType: deviceType,
+                clusterReplicationReestablishmentTimeout: clusterReplicationReestablishmentTimeout,
+                aofSizeLimit: aofSizeLimit,
+                compactionFrequencySecs: compactionFrequencySecs,
+                compactionType: compactionType,
+                latencyMonitory: latencyMonitory,
+                loggingFrequencySecs: loggingFrequencySecs,
+                checkpointThrottleFlushDelayMs: checkpointThrottleFlushDelayMs,
+                clusterReplicaResumeWithData: clusterReplicaResumeWithData,
+                replicaSyncTimeout: replicaSyncTimeout);
 
             foreach (var node in nodes)
                 node.Start();
@@ -192,6 +291,7 @@ namespace Garnet.test.cluster
         /// Create single cluster instance with corresponding options
         /// </summary>
         /// <param name="endpoint"></param>
+        /// <param name="enableCluster"></param>
         /// <param name="cleanClusterConfig"></param>
         /// <param name="tryRecover"></param>
         /// <param name="disableObjects"></param>
@@ -217,6 +317,7 @@ namespace Garnet.test.cluster
         /// <returns></returns>
         public GarnetServer CreateInstance(
             EndPoint endpoint,
+            bool enableCluster = true,
             bool cleanClusterConfig = true,
             bool disableEpochCollision = false,
             bool tryRecover = false,
@@ -238,6 +339,7 @@ namespace Garnet.test.cluster
             bool useTLS = false,
             bool useAcl = false,
             bool asyncReplay = false,
+            EndPoint clusterAnnounceEndpoint = null,
             X509CertificateCollection certificates = null,
             ServerCredential clusterCreds = new ServerCredential())
         {
@@ -246,6 +348,7 @@ namespace Garnet.test.cluster
                 TestFolder,
                 TestFolder,
                 endpoint,
+                enableCluster: enableCluster,
                 disablePubSub: true,
                 disableObjects: disableObjects,
                 enableAOF: enableAOF,
@@ -270,11 +373,11 @@ namespace Garnet.test.cluster
                 aclFile: credManager.aclFilePath,
                 authUsername: clusterCreds.user,
                 authPassword: clusterCreds.password,
-                certificates: certificates);
+                certificates: certificates,
+                clusterAnnounceEndpoint: clusterAnnounceEndpoint);
 
             return new GarnetServer(opts, loggerFactory);
         }
-
 
         /// <summary>
         /// Dispose created instances
@@ -283,26 +386,29 @@ namespace Garnet.test.cluster
         {
             if (nodes != null)
             {
-                for (var i = 0; i < nodes.Length; i++)
+                _ = Parallel.For(0, nodes.Length, i =>
                 {
                     if (nodes[i] != null)
                     {
                         logger.LogDebug("\t a. Dispose node {testName}", TestContext.CurrentContext.Test.Name);
-                        nodes[i].Dispose();
+                        var node = nodes[i];
                         nodes[i] = null;
+                        node.Dispose(true);
                         logger.LogDebug("\t b. Dispose node {testName}", TestContext.CurrentContext.Test.Name);
                     }
-                }
+                });
             }
         }
 
         /// <summary>
         /// Establish connection to cluster.
         /// </summary>
+        /// <param name="enabledCluster"></param>
         /// <param name="useTLS"></param>
         /// <param name="certificates"></param>
         /// <param name="clientCreds"></param>
         public void CreateConnection(
+            bool enabledCluster = true,
             bool useTLS = false,
             X509CertificateCollection certificates = null,
             ServerCredential clientCreds = new ServerCredential())
@@ -316,7 +422,7 @@ namespace Garnet.test.cluster
                 authUsername: clientCreds.user,
                 authPassword: clientCreds.password,
                 certificates: certificates);
-            clusterTestUtils.Connect(logger);
+            clusterTestUtils.Connect(cluster: enabledCluster, logger: logger);
             clusterTestUtils.PingAll(logger);
         }
 
@@ -586,6 +692,32 @@ namespace Garnet.test.cluster
                 else
                     ValidateNodeObjects(ref kvPairsObj, i);
             }
+        }
+
+        public List<byte[]> GenerateKeysWithPrefix(string prefix, int keyCount, int suffixLength)
+        {
+            var keyBuffer = new byte[2 + prefix.Length + suffixLength];
+            Encoding.ASCII.GetBytes("{" + prefix + "}").CopyTo(keyBuffer, 0);
+
+            var keys = new List<byte[]>();
+            for (var i = 0; i < keyCount; i++)
+            {
+                clusterTestUtils.RandomBytes(ref keyBuffer, 2 + prefix.Length);
+                keys.Add(keyBuffer.ToArray());
+            }
+            return keys;
+        }
+
+        public List<byte[]> GenerateIncreasingSizeValues(int minSize, int maxSize)
+        {
+            var values = new List<byte[]>();
+            for (var i = minSize; i <= maxSize; i++)
+            {
+                var valueBuffer = new byte[minSize];
+                clusterTestUtils.RandomBytes(ref valueBuffer, valueBuffer.Length);
+                values.Add(valueBuffer.ToArray());
+            }
+            return values;
         }
     }
 }
